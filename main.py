@@ -20,8 +20,8 @@ from loss import AverageMeter, Loss_MRAE, Loss_RMSE, Loss_PSNR, save_checkpoint
 DATA_ROOT = "data"
 DOWNLOAD_DATA = True
 
-TOTAL_IMAGES = 2
-TRAIN_IMAGES = 1
+TOTAL_IMAGES = 230
+TRAIN_IMAGES = 200
 CUBE_KEY = "cube"
 
 EPOCHS = 100
