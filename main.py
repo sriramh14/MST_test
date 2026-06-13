@@ -20,8 +20,8 @@ from loss import AverageMeter, Loss_MRAE, Loss_RMSE, Loss_PSNR, save_checkpoint
 DATA_ROOT = "data"
 DOWNLOAD_DATA = True
 
-TOTAL_IMAGES = 2
-TRAIN_IMAGES = 1
+TOTAL_IMAGES = 230
+TRAIN_IMAGES = 200
 CUBE_KEY = "cube"
 
 EPOCHS = 100
@@ -40,8 +40,8 @@ SEED = 42
 
 SAVE_DIR = "checkpoints_mstpp"
 RESUME_PATH = ""         # example: "checkpoints_mstpp/best.pth"
-BEST_MODEL_NAME = "best_mstpp.pth"
-LATEST_MODEL_NAME = "latest_mstpp.pth"
+BEST_MODEL_NAME = "best.pth"
+LATEST_MODEL_NAME = "latest.pth"
 
 
 # ==========================================================
@@ -140,7 +140,10 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device):
 
         with autocast(enabled=USE_AMP and device.type == "cuda"):
             pred = model(rgb)
-            loss = criterion(pred, hsi)
+
+            # loss.py uses .view(-1), which requires contiguous tensors.
+            # Keep loss.py unchanged and make tensors contiguous here.
+            loss = criterion(pred.contiguous(), hsi.contiguous())
 
         if USE_AMP and device.type == "cuda":
             scaler.scale(loss).backward()
@@ -186,9 +189,13 @@ def validate(model, loader, mrae_fn, rmse_fn, psnr_fn, device):
         pred = model(rgb)
         batch_size = rgb.size(0)
 
-        mrae = mrae_fn(pred, hsi)
-        rmse = rmse_fn(pred, hsi)
-        psnr = psnr_fn(hsi.clone(), pred.clone())
+        # Metrics also call the repo loss functions, so keep tensors contiguous.
+        pred_for_loss = pred.contiguous()
+        hsi_for_loss = hsi.contiguous()
+
+        mrae = mrae_fn(pred_for_loss, hsi_for_loss)
+        rmse = rmse_fn(pred_for_loss, hsi_for_loss)
+        psnr = psnr_fn(hsi_for_loss.clone(), pred_for_loss.clone())
 
         mrae_meter.update(mrae.item(), batch_size)
         rmse_meter.update(rmse.item(), batch_size)
