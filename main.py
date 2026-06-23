@@ -8,7 +8,9 @@ from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
 
 from dataset.dataset_loader import ARADDataset
-from model.MST_Plus_Plus import MST_Plus_Plus
+
+#Change file to MST_Plus_Plus or mst_plus_plus_cross_attn
+from model.mst_plus_plus_cross_attn import MST_Plus_Plus
 from loss import AverageMeter, Loss_MRAE, Loss_RMSE, Loss_PSNR, save_checkpoint
 
 
