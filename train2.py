@@ -62,7 +62,7 @@ EPOCHS = 100
 # Each sample is passed to MST++ at its original full resolution.
 BATCH_SIZE = 1
 NUM_WORKERS = 4
-LEARNING_RATE = 4e-4
+LEARNING_RATE = 1e-4
 MIN_LEARNING_RATE = 1e-7
 WEIGHT_DECAY = 1e-4
 VALIDATION_FRACTION = 0.1
