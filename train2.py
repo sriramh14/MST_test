@@ -2,8 +2,8 @@
 
 Edit the configuration section below, then run only one of:
 
-    python train_mst_plus_plus.py --mode train
-    python train_mst_plus_plus.py --mode infer
+    python mstpp_full_resolution_skip_corrupt.py --mode train
+    python mstpp_full_resolution_skip_corrupt.py --mode infer
 
 The parser intentionally contains no argument other than ``--mode``.
 """
@@ -11,6 +11,7 @@ The parser intentionally contains no argument other than ``--mode``.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -27,7 +28,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
-from model.MST_Plus_Plus import MST_Plus_Plus
+from models.MST_Plus_Plus import MST_Plus_Plus
 
 # Existing loss package supplied by the project.
 from loss.mrae import mrae
@@ -56,7 +57,7 @@ MODEL_STAGES = 3
 MODEL_FEATURES = 31              # required by the supplied MST++ implementation
 
 # Training settings
-EPOCHS = 50
+EPOCHS = 100
 # Keep this at 1 when images have different spatial resolutions.
 # Each sample is passed to MST++ at its original full resolution.
 BATCH_SIZE = 1
@@ -90,6 +91,12 @@ HSI_EXTENSIONS = {".mat", ".npy", ".npz", ".pt", ".pth"}
 RGB_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".npy", ".pt", ".pth"
 }
+
+# Fast corrupt-file filtering. The cache is reused until a file path, size,
+# or modification time changes. Set FORCE_REVALIDATE=True for a manual rescan.
+VALIDATION_CACHE = Path(OUTPUT_DIR) / "hsi_validation_cache.pth"
+INVALID_FILE_LOG = Path(OUTPUT_DIR) / "invalid_hsi_files.txt"
+FORCE_REVALIDATE = False
 
 
 # ============================================================
@@ -276,6 +283,203 @@ def build_pairs() -> List[Tuple[Path, Path]]:
         )
 
     return pairs
+
+
+# ============================================================
+# Fast HSI validation and cache
+# ============================================================
+
+def is_possible_hsi_shape(shape: Tuple[int, ...]) -> bool:
+    return (
+        len(shape) == 3
+        and HSI_CHANNELS in shape
+        and all(int(size) > 0 for size in shape)
+    )
+
+
+def inspect_hdf5_mat(path: Path) -> None:
+    """Inspect only HDF5 metadata; opening also detects truncated v7.3 files."""
+    candidates: List[Tuple[str, Tuple[int, ...]]] = []
+
+    with h5py.File(str(path), "r") as file:
+        if HSI_KEY in file and isinstance(file[HSI_KEY], h5py.Dataset):
+            dataset = file[HSI_KEY]
+            candidates.append((HSI_KEY, tuple(int(v) for v in dataset.shape)))
+
+        def visitor(name, obj):
+            if not isinstance(obj, h5py.Dataset) or obj.ndim != 3:
+                return
+            try:
+                if np.issubdtype(obj.dtype, np.number):
+                    record = (name, tuple(int(v) for v in obj.shape))
+                    if record not in candidates:
+                        candidates.append(record)
+            except TypeError:
+                return
+
+        file.visititems(visitor)
+
+    if not candidates:
+        raise ValueError(f"No numerical 3D HDF5 dataset found in {path}")
+
+    if not any(is_possible_hsi_shape(shape) for _, shape in candidates):
+        raise ValueError(
+            f"No {HSI_CHANNELS}-band cube found in {path}; "
+            f"HDF5 datasets={candidates}"
+        )
+
+
+def inspect_standard_mat(path: Path) -> None:
+    """Read the MAT directory only; do not load the full cube."""
+    try:
+        metadata = sio.whosmat(path)
+    except (NotImplementedError, ValueError, OSError):
+        # MATLAB v7.3 uses HDF5. h5py.File will also expose truncation errors.
+        inspect_hdf5_mat(path)
+        return
+
+    candidates = [
+        (name, tuple(int(v) for v in shape))
+        for name, shape, _dtype in metadata
+        if len(shape) == 3
+    ]
+
+    if not candidates:
+        raise ValueError(f"No 3D array found in {path}")
+
+    preferred = [item for item in candidates if item[0] == HSI_KEY]
+    shapes_to_check = preferred if preferred else candidates
+    if not any(is_possible_hsi_shape(shape) for _, shape in shapes_to_check):
+        raise ValueError(
+            f"No {HSI_CHANNELS}-band cube found in {path}; MAT arrays={candidates}"
+        )
+
+
+def inspect_hsi_metadata(path: Path) -> None:
+    """Validate shape/readability with the cheapest available operation."""
+    extension = path.suffix.lower()
+
+    if extension == ".mat":
+        inspect_standard_mat(path)
+        return
+
+    if extension == ".npy":
+        array = np.load(path, mmap_mode="r", allow_pickle=False)
+        if not is_possible_hsi_shape(tuple(int(v) for v in array.shape)):
+            raise ValueError(f"Invalid HSI shape {array.shape} in {path}")
+        return
+
+    if extension == ".npz":
+        with np.load(path, allow_pickle=False) as archive:
+            shapes = [
+                tuple(int(v) for v in archive[key].shape)
+                for key in archive.files
+                if archive[key].ndim == 3
+            ]
+        if not any(is_possible_hsi_shape(shape) for shape in shapes):
+            raise ValueError(f"No valid {HSI_CHANNELS}-band cube in {path}; shapes={shapes}")
+        return
+
+    # Tensor checkpoints cannot be inspected reliably without loading the object.
+    cube = load_hsi(path)
+    if not is_possible_hsi_shape(tuple(int(v) for v in cube.shape)):
+        raise ValueError(f"Invalid HSI shape {cube.shape} in {path}")
+
+
+def make_pairs_fingerprint(pairs: List[Tuple[Path, Path]]) -> str:
+    records = []
+    for hsi_path, rgb_path in pairs:
+        for path in (hsi_path, rgb_path):
+            stat = path.stat()
+            records.append(
+                f"{path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
+            )
+    return hashlib.sha256("\n".join(records).encode("utf-8")).hexdigest()
+
+
+def load_validation_cache(path: Path) -> dict:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        # Compatibility with older PyTorch versions without weights_only.
+        return torch.load(path, map_location="cpu")
+
+
+def filter_valid_pairs(
+    pairs: List[Tuple[Path, Path]],
+) -> List[Tuple[Path, Path]]:
+    """Skip unreadable HSI files before DataLoader workers are created."""
+    VALIDATION_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    INVALID_FILE_LOG.parent.mkdir(parents=True, exist_ok=True)
+
+    fingerprint = make_pairs_fingerprint(pairs)
+    pair_lookup = {str(hsi.resolve()): (hsi, rgb) for hsi, rgb in pairs}
+
+    if VALIDATION_CACHE.exists() and not FORCE_REVALIDATE:
+        try:
+            cached = load_validation_cache(VALIDATION_CACHE)
+            if isinstance(cached, dict) and cached.get("fingerprint") == fingerprint:
+                valid_pairs = [
+                    pair_lookup[path]
+                    for path in cached.get("valid_hsi_paths", [])
+                    if path in pair_lookup
+                ]
+                invalid_records = cached.get("invalid_records", [])
+
+                if valid_pairs:
+                    print("Using cached HSI validation.")
+                    print(f"Valid pairs: {len(valid_pairs)}")
+                    print(f"Skipped corrupt/invalid files: {len(invalid_records)}")
+                    for record in invalid_records[:10]:
+                        print(f"  Skipped: {record['path']} | {record['error']}")
+                    return valid_pairs
+        except Exception as error:
+            print(f"Validation cache could not be used; rescanning. Reason: {error}")
+
+    print(f"Checking {len(pairs)} HSI files using metadata only...")
+    valid_pairs: List[Tuple[Path, Path]] = []
+    invalid_records = []
+
+    for index, (hsi_path, rgb_path) in enumerate(pairs, start=1):
+        try:
+            inspect_hsi_metadata(hsi_path)
+            valid_pairs.append((hsi_path, rgb_path))
+        except Exception as error:
+            invalid_records.append(
+                {
+                    "path": str(hsi_path.resolve()),
+                    "error": f"{type(error).__name__}: {error}",
+                }
+            )
+            print(f"  Skipping invalid HSI: {hsi_path.name} | {error}")
+
+        if index % 100 == 0 or index == len(pairs):
+            print(
+                f"  Checked {index}/{len(pairs)} | "
+                f"valid={len(valid_pairs)} | invalid={len(invalid_records)}"
+            )
+
+    if not valid_pairs:
+        raise RuntimeError("No valid HSI/RGB pairs remain after validation")
+
+    if invalid_records:
+        with INVALID_FILE_LOG.open("w", encoding="utf-8") as file:
+            for record in invalid_records:
+                file.write(f"{record['path']} | {record['error']}\n")
+        print(f"Invalid-file log saved to: {INVALID_FILE_LOG}")
+    elif INVALID_FILE_LOG.exists():
+        INVALID_FILE_LOG.unlink()
+
+    torch.save(
+        {
+            "fingerprint": fingerprint,
+            "valid_hsi_paths": [str(hsi.resolve()) for hsi, _ in valid_pairs],
+            "invalid_records": invalid_records,
+        },
+        VALIDATION_CACHE,
+    )
+    print(f"Validation cache saved to: {VALIDATION_CACHE}")
+    return valid_pairs
 
 
 # ============================================================
@@ -534,6 +738,7 @@ def train() -> None:
     use_amp = USE_AMP and device.type == "cuda"
 
     all_pairs = build_pairs()
+    all_pairs = filter_valid_pairs(all_pairs)
     random.Random(SEED).shuffle(all_pairs)
 
     validation_size = max(1, int(len(all_pairs) * VALIDATION_FRACTION))
