@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
-from models.MST_Plus_Plus import MST_Plus_Plus
+from model.MST_Plus_Plus import MST_Plus_Plus
 
 # Existing loss package supplied by the project.
 from loss.mrae import mrae
