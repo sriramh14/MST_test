@@ -56,7 +56,7 @@ MODEL_STAGES = 3
 MODEL_FEATURES = 31              # required by the supplied MST++ implementation
 
 # Training settings
-EPOCHS = 100
+EPOCHS = 50
 # Keep this at 1 when images have different spatial resolutions.
 # Each sample is passed to MST++ at its original full resolution.
 BATCH_SIZE = 1
