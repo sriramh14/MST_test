@@ -45,7 +45,7 @@ RGB_DATA_DIR = "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_RGB/Train_R
 OUTPUT_DIR = "./mstpp_bbdm_checkpoints"
 
 # Pretrained frozen MST++ checkpoint
-MSTPP_CHECKPOINT = "./mstpp_checkpoints/best_mstpp.pth"
+MSTPP_CHECKPOINT = "./mstpp_checkpoints/mst_plus_plus.pth"
 
 # HSI data settings
 HSI_CHANNELS = 31
