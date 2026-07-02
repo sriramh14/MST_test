@@ -65,6 +65,7 @@ WEIGHT_DECAY = 1e-4
 VALIDATION_FRACTION = 0.1
 USE_AUGMENTATION = True
 USE_AMP = True
+AMP_INITIAL_SCALE = 1024.0
 GRADIENT_CLIP_NORM = 1.0
 PRINT_EVERY = 30
 SEED = 42
@@ -837,13 +838,38 @@ def train_one_epoch(
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        gradient_norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(), GRADIENT_CLIP_NORM
+        
+        gradients_are_finite = all(
+            parameter.grad is None
+            or torch.isfinite(parameter.grad).all().item()
+            for parameter in model.parameters()
         )
-        if not torch.isfinite(gradient_norm):
-            raise FloatingPointError(
-                f"Non-finite gradient norm at batch {batch_index}: {gradient_norm}"
+        
+        if not gradients_are_finite:
+            if not use_amp:
+                raise FloatingPointError(
+                    f"Non-finite gradients at batch {batch_index} with AMP disabled."
+                )
+        
+            previous_scale = scaler.get_scale()
+        
+            # Skip this optimizer update. unscale_() has already recorded
+            # the overflow, so update() will lower the AMP scale.
+            optimizer.zero_grad(set_to_none=True)
+            scaler.update()
+        
+            print(
+                f"WARNING: skipped batch {batch_index} because AMP gradients "
+                f"overflowed; scale {previous_scale:g} -> {scaler.get_scale():g}"
             )
+            continue
+        
+        gradient_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            GRADIENT_CLIP_NORM,
+            error_if_nonfinite=True,
+        )
+        
         scaler.step(optimizer)
         scaler.update()
 
@@ -980,7 +1006,7 @@ def train() -> None:
         T_max=EPOCHS,
         eta_min=MIN_LEARNING_RATE,
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp,init_scale=AMP_INITIAL_SCALE)
 
     start_epoch = 1
     best_mrae = float("inf")
