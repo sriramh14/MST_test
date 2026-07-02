@@ -2,8 +2,8 @@
 
 Edit the configuration section below, then run only one of:
 
-    python mstpp_full_resolution_skip_corrupt.py --mode train
-    python mstpp_full_resolution_skip_corrupt.py --mode infer
+    python mstpp_full_resolution_fixed_losses.py --mode train
+    python mstpp_full_resolution_fixed_losses.py --mode infer
 
 The parser intentionally contains no argument other than ``--mode``.
 """
@@ -30,12 +30,9 @@ from torch.utils.data import DataLoader, Dataset
 
 from model.MST_Plus_Plus import MST_Plus_Plus
 
-# Existing loss package supplied by the project.
-from loss.mrae import mrae
-from loss.rmse import rmse
-from loss.sam import sam
-from loss.psnr import psnr
-from loss.ssim import ssim
+# Losses and metrics are implemented directly below.
+# This avoids argument-order, reduction, epsilon, and AMP differences between
+# external metric implementations.
 
 
 # ============================================================
@@ -71,6 +68,16 @@ USE_AMP = True
 GRADIENT_CLIP_NORM = 1.0
 PRINT_EVERY = 30
 SEED = 42
+
+# Stable loss/metric settings. The NTIRE spectral cubes are normally in [0, 1].
+# Change METRIC_DATA_RANGE only when the target data uses another fixed range.
+MRAE_EPSILON = 1e-3
+SAM_EPSILON = 1e-8
+METRIC_DATA_RANGE = 1.0
+SSIM_WINDOW_SIZE = 11
+SSIM_SIGMA = 1.5
+REPORT_SAM_IN_DEGREES = False
+WARN_ON_RANGE_MISMATCH = True
 
 # Leave as None to start training from epoch 1.
 RESUME_CHECKPOINT: Optional[str] = None
@@ -112,12 +119,6 @@ def set_seed(seed: int) -> None:
 
 def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def scalar_value(value: torch.Tensor | float) -> float:
-    if isinstance(value, torch.Tensor):
-        return float(value.detach().mean().item())
-    return float(value)
 
 
 # ============================================================
@@ -537,12 +538,158 @@ class RGBHSIDataset(Dataset):
 # Losses, metrics, and residual heatmap
 # ============================================================
 
+def unwrap_prediction(output: torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, ...]) -> torch.Tensor:
+    """Return the final reconstruction if a model returns intermediate outputs."""
+    if isinstance(output, (list, tuple)):
+        if not output:
+            raise ValueError("The model returned an empty output sequence")
+        output = output[-1]
+    if not isinstance(output, torch.Tensor):
+        raise TypeError(f"Expected model output to be a tensor, found {type(output)}")
+    return output
+
+
+def check_prediction_target_shapes(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+) -> None:
+    if prediction.shape != target.shape:
+        raise ValueError(
+            "Prediction and target must have identical BCHW shapes; "
+            f"prediction={tuple(prediction.shape)}, target={tuple(target.shape)}"
+        )
+    if prediction.ndim != 4:
+        raise ValueError(
+            f"Expected BCHW prediction and target tensors, found {prediction.ndim} dimensions"
+        )
+
+
+def stable_mrae_per_sample(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """MRAE per image, computed in float32 with a non-underflowing denominator."""
+    prediction = prediction.float()
+    target = target.float()
+    denominator = target.abs().clamp_min(MRAE_EPSILON)
+    return ((prediction - target).abs() / denominator).mean(dim=(1, 2, 3))
+
+
 def reconstruction_loss(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Optimization loss. MRAE follows the target, prediction order used by the loss package."""
-    value = mrae(target, prediction)
-    if not isinstance(value, torch.Tensor):
-        raise TypeError("loss.mrae.mrae must return a torch.Tensor during training")
-    return value.mean()
+    """Stable optimization loss; always evaluated outside mixed precision."""
+    check_prediction_target_shapes(prediction, target)
+    with torch.amp.autocast(device_type=prediction.device.type, enabled=False):
+        return stable_mrae_per_sample(prediction, target).mean()
+
+
+def _gaussian_kernel(
+    channels: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    window_size = min(SSIM_WINDOW_SIZE, 11)
+    if window_size % 2 == 0:
+        window_size -= 1
+    coordinates = torch.arange(window_size, device=device, dtype=dtype)
+    coordinates = coordinates - (window_size - 1) / 2
+    gaussian = torch.exp(-(coordinates.square()) / (2 * SSIM_SIGMA * SSIM_SIGMA))
+    gaussian = gaussian / gaussian.sum()
+    kernel_2d = torch.outer(gaussian, gaussian)
+    return kernel_2d.view(1, 1, window_size, window_size).expand(
+        channels, 1, window_size, window_size
+    ).contiguous()
+
+
+def _ssim_filter(image: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
+    padding = kernel.shape[-1] // 2
+    height, width = image.shape[-2:]
+    padding_mode = "reflect" if height > padding and width > padding else "replicate"
+    image = F.pad(image, (padding, padding, padding, padding), mode=padding_mode)
+    return F.conv2d(image, kernel, groups=image.shape[1])
+
+
+def ssim_per_sample(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Windowed SSIM averaged over all spectral bands and spatial positions."""
+    channels = prediction.shape[1]
+    kernel = _gaussian_kernel(channels, prediction.device, prediction.dtype)
+
+    mu_prediction = _ssim_filter(prediction, kernel)
+    mu_target = _ssim_filter(target, kernel)
+
+    mu_prediction_sq = mu_prediction.square()
+    mu_target_sq = mu_target.square()
+    mu_cross = mu_prediction * mu_target
+
+    sigma_prediction_sq = (
+        _ssim_filter(prediction.square(), kernel) - mu_prediction_sq
+    ).clamp_min(0.0)
+    sigma_target_sq = (
+        _ssim_filter(target.square(), kernel) - mu_target_sq
+    ).clamp_min(0.0)
+    sigma_cross = _ssim_filter(prediction * target, kernel) - mu_cross
+
+    c1 = (0.01 * METRIC_DATA_RANGE) ** 2
+    c2 = (0.03 * METRIC_DATA_RANGE) ** 2
+    numerator = (2.0 * mu_cross + c1) * (2.0 * sigma_cross + c2)
+    denominator = (
+        (mu_prediction_sq + mu_target_sq + c1)
+        * (sigma_prediction_sq + sigma_target_sq + c2)
+    ).clamp_min(1e-12)
+
+    return (numerator / denominator).mean(dim=(1, 2, 3))
+
+
+@torch.no_grad()
+def calculate_metric_tensors(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    """Return one value per image for every metric."""
+    check_prediction_target_shapes(prediction, target)
+
+    prediction = prediction.detach().float()
+    target = target.detach().float()
+    error = prediction - target
+    mse = error.square().mean(dim=(1, 2, 3))
+
+    mrae_values = stable_mrae_per_sample(prediction, target)
+    rmse_values = mse.sqrt()
+    psnr_values = 10.0 * torch.log10(
+        (METRIC_DATA_RANGE ** 2) / mse.clamp_min(1e-12)
+    )
+
+    dot_product = (prediction * target).sum(dim=1)
+    prediction_norm = prediction.square().sum(dim=1).sqrt()
+    target_norm = target.square().sum(dim=1).sqrt()
+    norm_product = prediction_norm * target_norm
+    valid_pixels = norm_product > SAM_EPSILON
+
+    cosine = dot_product / norm_product.clamp_min(SAM_EPSILON)
+    angle = torch.acos(cosine.clamp(-1.0, 1.0))
+    angle = torch.where(valid_pixels, angle, torch.zeros_like(angle))
+    valid_count = valid_pixels.sum(dim=(1, 2)).clamp_min(1)
+    sam_values = angle.sum(dim=(1, 2)) / valid_count
+    if REPORT_SAM_IN_DEGREES:
+        sam_values = torch.rad2deg(sam_values)
+
+    ssim_values = ssim_per_sample(prediction, target)
+
+    metrics = {
+        "mrae": mrae_values,
+        "rmse": rmse_values,
+        "sam": sam_values,
+        "psnr": psnr_values,
+        "ssim": ssim_values,
+    }
+    for name, values in metrics.items():
+        if not torch.isfinite(values).all():
+            raise FloatingPointError(
+                f"Non-finite {name} values: {values.detach().cpu().tolist()}"
+            )
+    return metrics
 
 
 @torch.no_grad()
@@ -550,16 +697,36 @@ def calculate_metrics(
     prediction: torch.Tensor,
     target: torch.Tensor,
 ) -> Dict[str, float]:
-    prediction = prediction.detach().float()
-    target = target.detach().float()
+    """Return image-averaged metrics for inference reporting."""
+    tensors = calculate_metric_tensors(prediction, target)
+    return {name: float(values.mean().item()) for name, values in tensors.items()}
 
-    return {
-        "mrae": scalar_value(mrae(target, prediction)),
-        "rmse": scalar_value(rmse(target, prediction)),
-        "sam": scalar_value(sam(target, prediction)),
-        "psnr": scalar_value(psnr(target, prediction)),
-        "ssim": scalar_value(ssim(target, prediction)),
-    }
+
+def print_range_diagnostics(
+    rgb: torch.Tensor,
+    hsi: torch.Tensor,
+    prefix: str,
+) -> None:
+    rgb_min = float(rgb.detach().min().item())
+    rgb_max = float(rgb.detach().max().item())
+    hsi_min = float(hsi.detach().min().item())
+    hsi_max = float(hsi.detach().max().item())
+    near_zero_fraction = float(
+        (hsi.detach().abs() < MRAE_EPSILON).float().mean().item()
+    )
+    print(
+        f"{prefix} ranges | RGB=[{rgb_min:.6f}, {rgb_max:.6f}] | "
+        f"HSI=[{hsi_min:.6f}, {hsi_max:.6f}] | "
+        f"HSI |x|<{MRAE_EPSILON:g}: {100.0 * near_zero_fraction:.3f}%"
+    )
+    if WARN_ON_RANGE_MISMATCH and (
+        hsi_min < -1e-4 or hsi_max > METRIC_DATA_RANGE + 1e-4
+    ):
+        print(
+            "WARNING: HSI values are outside the expected metric range "
+            f"[0, {METRIC_DATA_RANGE}]. Set NORMALIZATION or "
+            "METRIC_DATA_RANGE consistently before interpreting PSNR/SSIM."
+        )
 
 
 class ResidualHeatmap(nn.Module):
@@ -611,6 +778,17 @@ def empty_metric_sums() -> Dict[str, float]:
     }
 
 
+def add_batch_metrics(
+    sums: Dict[str, float],
+    batch_metrics: Dict[str, torch.Tensor],
+) -> None:
+    # Sum per-image values. This avoids accidentally averaging a batch scalar
+    # twice and remains correct when the final batch is smaller.
+    for name, values in batch_metrics.items():
+        sums[name] += float(values.detach().sum().item())
+    sums["loss"] += float(batch_metrics["mrae"].detach().sum().item())
+
+
 def average_metric_sums(sums: Dict[str, float], count: int) -> Dict[str, float]:
     if count == 0:
         raise RuntimeError("No samples were processed")
@@ -618,13 +796,13 @@ def average_metric_sums(sums: Dict[str, float], count: int) -> Dict[str, float]:
 
 
 def print_metrics(prefix: str, values: Dict[str, float]) -> None:
+    sam_label = "SAM(deg)" if REPORT_SAM_IN_DEGREES else "SAM(rad)"
     print(
         f"{prefix} | "
-        f"Loss: {values['loss']:.6f} | "
-        f"MRAE: {values['mrae']:.6f} | "
+        f"Loss/MRAE: {values['loss']:.6f} | "
         f"RMSE: {values['rmse']:.6f} | "
-        f"SAM: {values['sam']:.6f} | "
-        f"PSNR: {values['psnr']:.4f} | "
+        f"{sam_label}: {values['sam']:.6f} | "
+        f"PSNR: {values['psnr']:.4f} dB | "
         f"SSIM: {values['ssim']:.4f}"
     )
 
@@ -646,24 +824,32 @@ def train_one_epoch(
         hsi = hsi.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-            prediction = model(rgb)
-            loss = reconstruction_loss(prediction, hsi)
+        if batch_index == 1:
+            print_range_diagnostics(rgb, hsi, "  Train")
 
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            prediction = unwrap_prediction(model(rgb))
+
+        # MRAE is deliberately computed in float32, outside autocast.
+        loss = reconstruction_loss(prediction, hsi)
         if not torch.isfinite(loss):
             raise FloatingPointError(f"Non-finite training loss: {loss.item()}")
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP_NORM)
+        gradient_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), GRADIENT_CLIP_NORM
+        )
+        if not torch.isfinite(gradient_norm):
+            raise FloatingPointError(
+                f"Non-finite gradient norm at batch {batch_index}: {gradient_norm}"
+            )
         scaler.step(optimizer)
         scaler.update()
 
         batch_size = rgb.size(0)
-        batch_metrics = calculate_metrics(prediction, hsi)
-        sums["loss"] += scalar_value(loss) * batch_size
-        for name, value in batch_metrics.items():
-            sums[name] += value * batch_size
+        batch_metrics = calculate_metric_tensors(prediction, hsi)
+        add_batch_metrics(sums, batch_metrics)
         sample_count += batch_size
 
         if batch_index % PRINT_EVERY == 0 or batch_index == len(loader):
@@ -686,19 +872,20 @@ def validate(
     sums = empty_metric_sums()
     sample_count = 0
 
-    for rgb, hsi in loader:
+    for batch_index, (rgb, hsi) in enumerate(loader, start=1):
         rgb = rgb.to(device, non_blocking=True)
         hsi = hsi.to(device, non_blocking=True)
 
-        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-            prediction = model(rgb)
-            loss = reconstruction_loss(prediction, hsi)
+        if batch_index == 1:
+            print_range_diagnostics(rgb, hsi, "  Validation")
 
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            prediction = unwrap_prediction(model(rgb))
+
+        # Compute all metrics from the same float32, unclamped prediction.
         batch_size = rgb.size(0)
-        batch_metrics = calculate_metrics(prediction, hsi)
-        sums["loss"] += scalar_value(loss) * batch_size
-        for name, value in batch_metrics.items():
-            sums[name] += value * batch_size
+        batch_metrics = calculate_metric_tensors(prediction, hsi)
+        add_batch_metrics(sums, batch_metrics)
         sample_count += batch_size
 
     return average_metric_sums(sums, sample_count)
@@ -721,6 +908,12 @@ def save_checkpoint(
             "scheduler_state_dict": scheduler.state_dict(),
             "best_mrae": best_mrae,
             "normalization": NORMALIZATION,
+            "metric_config": {
+                "mrae_epsilon": MRAE_EPSILON,
+                "sam_epsilon": SAM_EPSILON,
+                "data_range": METRIC_DATA_RANGE,
+                "sam_in_degrees": REPORT_SAM_IN_DEGREES,
+            },
             "model_config": {
                 "in_channels": 3,
                 "out_channels": HSI_CHANNELS,
@@ -889,7 +1082,7 @@ def infer() -> None:
     rgb = torch.from_numpy(load_rgb(rgb_path)).unsqueeze(0).to(device)
 
     with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-        prediction = model(rgb)
+        prediction = unwrap_prediction(model(rgb))
 
     prediction = prediction.float()
     if CLAMP_INFERENCE_OUTPUT:
