@@ -73,7 +73,7 @@ RESSHIFT_MST_STAGE = 2
 RESSHIFT_NUM_BLOCKS = (1, 1, 1)
 
 # Training settings
-EPOCHS = 75
+EPOCHS = 60
 # Keep this at 1 when full-resolution images have different spatial sizes.
 BATCH_SIZE = 1
 NUM_WORKERS = 4
