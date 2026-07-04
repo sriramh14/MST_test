@@ -49,7 +49,7 @@ from torch.utils.data import DataLoader, Dataset
 
 # TODO: adjust this import to wherever you saved the ResShiftSSR model file
 # (the file that defines ResShiftDiffusion, ResShiftDenoiser and ResShiftSSR).
-from models.resshift_ssr import ResShiftSSR
+from model.resshift import ResShiftSSR
 
 from loss.mrae import mrae
 from loss.psnr import psnr
