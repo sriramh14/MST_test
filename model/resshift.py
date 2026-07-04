@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # TODO: import MST_Plus_Plus from your model file, e.g.:
-from MST_Plus_Plus import MST_Plus_Plus
+from .MST_Plus_Plus import MST_Plus_Plus
 
 
 def get_resshift_schedule(T=15, p=0.3, kappa=2.0):
