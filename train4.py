@@ -36,7 +36,7 @@ from model.MST_Plus_Plus import MST_Plus_Plus
 
 # Import the ResShift modules from your separate file
 # Note: Ensure the filename matches your actual ResShift file (e.g., reshift_mst.py)
-from resshift import ResShiftDenoiser, MSTPlusPlusResShift
+from model.resshift import ResShiftDenoiser, MSTPlusPlusResShift
 
 # ============================================================
 # Configuration
