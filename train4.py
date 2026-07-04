@@ -116,8 +116,8 @@ RESUME_CHECKPOINT: Optional[str] = None
 
 # Inference settings
 INFERENCE_RESSHIFT_CHECKPOINT = "./mstpp_resshift_checkpoints/best_resshift.pth"
-INFERENCE_RGB_PATH = "./test_rgb.png"
-INFERENCE_HSI_PATH: Optional[str] = "./test_hsi.mat"
+INFERENCE_RGB_PATH = "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_RGB/Train_RGB/ARAD_1K_0029.jpg"
+INFERENCE_HSI_PATH: Optional[str] = "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_spectral/Train_spectral/ARAD_1K_0029.mat"
 INFERENCE_OUTPUT_DIR = "./mstpp_resshift_results"
 CLAMP_INFERENCE_OUTPUT = True
 INFERENCE_STOCHASTIC = True     # ResShift's reverse process is stochastic by design
