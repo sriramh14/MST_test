@@ -25,9 +25,11 @@ Key behaviour
    differentiable, HSI-specific regulariser that discourages spectral
    distortion introduced by pixel-wise losses alone.
 8. Regardless of the training loss, mrae / rmse / sam / psnr / ssim are always
-   computed and reported for both the coarse network's prediction (y0) and the
-   fully diffusion-refined output, so you can see how much the diffusion stage
-   improves on the coarse RGB->HSI network at every validation epoch.
+   computed every epoch for the coarse network's prediction (y0) and for the
+   denoiser's cheap single-step x0 estimate. The fully diffusion-refined
+   output (T-step reverse sampling) is only run ONCE, after the final
+   training epoch, since it is far more expensive; its metrics are saved
+   in the final checkpoint and printed at the end of the run.
 """
 
 from __future__ import annotations
@@ -49,7 +51,7 @@ from torch.utils.data import DataLoader, Dataset
 
 # TODO: adjust this import to wherever you saved the ResShiftSSR model file
 # (the file that defines ResShiftDiffusion, ResShiftDenoiser and ResShiftSSR).
-from model.resshift import ResShiftSSR
+from models.resshift_ssr import ResShiftSSR
 
 from loss.mrae import mrae
 from loss.psnr import psnr
@@ -137,14 +139,16 @@ SAM_LOSS_WEIGHT_START = 0.0
 SAM_LOSS_WEIGHT_END = 0.05
 SAM_WARMUP_EPOCHS = 30
 
-# Full reverse-diffusion sampling (T forward passes through the denoiser) is
-# run for every validation image so mrae/rmse/sam/psnr/ssim reflect the
-# model's actual inference-time output, not just the single-step x0 estimate.
-# Set > 1 to only run full sampling every N epochs if this is too slow.
-FULL_SAMPLING_VALIDATE_EVERY_N_EPOCHS = 1
+# Full reverse-diffusion sampling (T forward passes through the denoiser,
+# per validation image) is expensive, so it is only run once, after the
+# final training epoch, to report the model's true inference-time
+# mrae/rmse/sam/psnr/ssim. Every other epoch only computes the cheap
+# single-step x0 estimate (quick_metrics) for monitoring convergence.
 
-# The best checkpoint is selected using the full-sampling validation MRAE,
-# since that is the metric that reflects final reconstruction quality.
+# The best checkpoint is selected using the cheap single-step validation
+# MRAE (quick_metrics), since that is available every epoch. A separate,
+# final checkpoint with true full-sampling metrics is saved after the last
+# epoch.
 VALIDATION_CACHE = Path(OUTPUT_DIR) / "resshift_validation_cache.pth"
 HSI_CHECKER_VERSION = "resshift-rgb-hsi-pair-cache-v1"
 
@@ -1354,6 +1358,7 @@ def main() -> None:
 
     for epoch in range(1, NUM_EPOCHS + 1):
         sam_weight = get_sam_weight(epoch)
+        is_last_epoch = epoch == NUM_EPOCHS
 
         print(
             f"\nEpoch {epoch:03d}/{NUM_EPOCHS:03d} | "
@@ -1371,7 +1376,9 @@ def main() -> None:
             sam_weight=sam_weight,
         )
 
-        run_full_sampling = (epoch % FULL_SAMPLING_VALIDATE_EVERY_N_EPOCHS) == 0
+        # Full T-step reverse-diffusion sampling only runs after the final
+        # epoch, since it is far more expensive than the single-step
+        # quick_metrics computed every epoch below.
         quick_metrics, coarse_metrics, full_sample_metrics = validate(
             model=model,
             loader=validation_loader,
@@ -1379,7 +1386,7 @@ def main() -> None:
             use_amp=use_amp,
             loss_type=DIFFUSION_LOSS_TYPE,
             sam_weight=sam_weight,
-            run_full_sampling=run_full_sampling,
+            run_full_sampling=is_last_epoch,
         )
 
         lr_scheduler.step()
@@ -1404,9 +1411,10 @@ def main() -> None:
             f"SSIM: {coarse_metrics['ssim']:.4f}"
         )
 
-        if run_full_sampling:
+        if is_last_epoch:
             print(
-                f"  Full diffusion sample | MRAE: {full_sample_metrics['mrae']:.6f} | "
+                f"  Full diffusion sample (final epoch) | "
+                f"MRAE: {full_sample_metrics['mrae']:.6f} | "
                 f"RMSE: {full_sample_metrics['rmse']:.6f} | "
                 f"SAM: {full_sample_metrics['sam']:.6f} | "
                 f"PSNR: {full_sample_metrics['psnr']:.4f} | "
@@ -1426,8 +1434,11 @@ def main() -> None:
             full_sample_metrics=full_sample_metrics,
         )
 
-        if run_full_sampling and full_sample_metrics["mrae"] < best_validation_mrae:
-            best_validation_mrae = full_sample_metrics["mrae"]
+        # Best checkpoint is tracked using the cheap single-step MRAE, since
+        # that is the only quality signal available every epoch now that
+        # full sampling only happens at the very end.
+        if quick_metrics["mrae"] < best_validation_mrae:
+            best_validation_mrae = quick_metrics["mrae"]
             save_checkpoint(
                 output_path=output_dir / "best_resshift.pth",
                 model=model,
@@ -1442,7 +1453,30 @@ def main() -> None:
             )
             print(
                 "  New best checkpoint: "
-                f"full-sample validation MRAE = {best_validation_mrae:.6f}"
+                f"single-step validation MRAE = {best_validation_mrae:.6f}"
+            )
+
+        if is_last_epoch:
+            save_checkpoint(
+                output_path=output_dir / "final_resshift_with_full_sampling.pth",
+                model=model,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
+                scaler=scaler,
+                epoch=epoch,
+                sam_weight=sam_weight,
+                quick_metrics=quick_metrics,
+                coarse_metrics=coarse_metrics,
+                full_sample_metrics=full_sample_metrics,
+            )
+            print(
+                "\nTraining complete. Final full-sampling validation metrics:\n"
+                f"  MRAE: {full_sample_metrics['mrae']:.6f} | "
+                f"RMSE: {full_sample_metrics['rmse']:.6f} | "
+                f"SAM: {full_sample_metrics['sam']:.6f} | "
+                f"PSNR: {full_sample_metrics['psnr']:.4f} | "
+                f"SSIM: {full_sample_metrics['ssim']:.4f}\n"
+                f"Saved to: {output_dir / 'final_resshift_with_full_sampling.pth'}"
             )
 
 
