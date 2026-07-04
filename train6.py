@@ -39,6 +39,18 @@ Key behaviour
    output (multi-step DDIM/DDPM reverse sampling) is only run ONCE, after the
    final training epoch, since it is far more expensive; its metrics are
    saved in the final checkpoint and printed at the end of the run.
+
+Compatibility note
+-------------------
+This script was checked against the corrected `ResidualDiffusionRGB2HSI`
+model file (which fixes a skip-connection channel-bookkeeping bug in
+`ResidualUNet` and replaces every `GroupNorm` with a `LayerNorm2d`). Neither
+fix changes the model's public interface: `model(rgb, gt_hsi)` still returns
+a dict with `mst_prediction` / `predicted_residual` / `target_residual`;
+`model.sample(...)` and `model.get_coarse_prediction(...)` are unchanged;
+`model.mst_plus_plus` and `model._freeze_mst_plus_plus()` are unchanged. No
+changes were required in this file for compatibility with the corrected
+model.
 """
 
 from __future__ import annotations
