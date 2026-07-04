@@ -96,6 +96,34 @@ Those are assumed to live elsewhere in your codebase.
 
 Imports of MST++, and any other project-specific utilities, are given as
 placeholders -- adjust the import paths to match your project structure.
+
+--------------------------------------------------------------------------
+Bug-fix notes (read this before diffing against an older version)
+--------------------------------------------------------------------------
+Two issues were fixed relative to a previous version of this file. See the
+"Summary of Changes" delivered alongside this file for full details; in
+short:
+
+  1. `ResidualUNet.forward()` pushed exactly one skip-connection tensor per
+     encoder *stage* (plus one after each downsample), while
+     `ResidualUNet.__init__()` sized the decoder's input convolutions
+     assuming one skip-channel entry per *residual block* (plus one after
+     each downsample). This caused the decoder's popped skip tensors to
+     desynchronize from the channel counts the ResBlocks were built for,
+     eventually feeding a tensor with the wrong number of channels into a
+     normalization layer sized for a different channel count. `forward()`
+     now pushes (and pops) exactly one skip tensor per residual block, and
+     the encoder/decoder are verified to agree on skip channel counts and
+     ordering.
+  2. Every `nn.GroupNorm` has been replaced with a correct `LayerNorm2d`
+     module (channels-last permute -> `nn.LayerNorm` over the channel
+     dimension -> permute back), as requested. No other normalization
+     semantics were changed.
+
+No architectural elements were added, removed, or redesigned: the encoder
+depth, channel multipliers, number of residual blocks per stage, attention
+placement, skip-connection topology, diffusion schedules, SDT/selective
+hourglass mapping, and residual formulation are all unchanged.
 """
 
 import math
@@ -154,6 +182,42 @@ class DiffusionEmbedding(nn.Module):
 
 
 # ==========================================================================
+# Normalization
+# ==========================================================================
+
+class LayerNorm2d(nn.Module):
+    """
+    LayerNorm for [B, C, H, W] convolutional feature maps.
+
+    `nn.LayerNorm` normalizes over the trailing dimension(s) it is given, so
+    it cannot be applied directly to a channels-first [B, C, H, W] tensor
+    the way `nn.GroupNorm` can. This module permutes the tensor to
+    channels-last ([B, H, W, C]), applies `nn.LayerNorm` over the channel
+    dimension (normalizing each spatial position independently across its C
+    channels, matching GroupNorm-with-num_groups=1's per-sample statistics
+    granularity), and permutes back to channels-first.
+
+    This intentionally replaces every `nn.GroupNorm` in this file, as
+    requested, while preserving the "normalize, then let the network learn
+    a scale/shift" role that GroupNorm played -- only the statistics
+    grouping changes (per-position-per-channel-vector instead of
+    per-channel-group-over-space).
+    """
+
+    def __init__(self, num_channels: int, eps: float = 1e-6):
+        super().__init__()
+        self.norm = nn.LayerNorm(num_channels, eps=eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [B, C, H, W] -> [B, H, W, C]
+        x = x.permute(0, 2, 3, 1)
+        x = self.norm(x)
+        # [B, H, W, C] -> [B, C, H, W]
+        x = x.permute(0, 3, 1, 2).contiguous()
+        return x
+
+
+# ==========================================================================
 # U-Net building blocks
 # ==========================================================================
 
@@ -161,12 +225,9 @@ class ResBlock(nn.Module):
     """Residual block with time-embedding conditioning (DDPM-style)."""
 
     def __init__(self, in_channels: int, out_channels: int, time_emb_dim: int,
-                 dropout: float = 0.0, groups: int = 8):
+                 dropout: float = 0.0):
         super().__init__()
-        groups_in = min(groups, in_channels)
-        groups_out = min(groups, out_channels)
-
-        self.norm1 = nn.GroupNorm(groups_in, in_channels)
+        self.norm1 = LayerNorm2d(in_channels)
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
 
         self.time_proj = nn.Sequential(
@@ -174,7 +235,7 @@ class ResBlock(nn.Module):
             nn.Linear(time_emb_dim, out_channels),
         )
 
-        self.norm2 = nn.GroupNorm(groups_out, out_channels)
+        self.norm2 = LayerNorm2d(out_channels)
         self.dropout = nn.Dropout(dropout)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
 
@@ -193,10 +254,9 @@ class ResBlock(nn.Module):
 class AttentionBlock(nn.Module):
     """Simple single-head self-attention block, used at low spatial resolutions."""
 
-    def __init__(self, channels: int, groups: int = 8):
+    def __init__(self, channels: int):
         super().__init__()
-        groups = min(groups, channels)
-        self.norm = nn.GroupNorm(groups, channels)
+        self.norm = LayerNorm2d(channels)
         self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1)
         self.proj_out = nn.Conv2d(channels, channels, kernel_size=1)
 
@@ -246,6 +306,17 @@ class ResidualUNet(nn.Module):
     Explicit condition (per DiffUIR): the conditioning image is additionally
     injected into the diffusion algorithm itself (via the forward/reverse
     equations in `ResidualDiffusionScheduler`), not inside this network.
+
+    Skip-connection bookkeeping
+    ----------------------------
+    The encoder pushes exactly one skip tensor onto the skip stack per
+    residual block it runs (attention blocks do not add a new skip, since
+    they never change the channel count), plus one more skip tensor after
+    each downsampling operation. The `channels` list built below during
+    `__init__` mirrors that exactly, one entry per push, so that the
+    decoder's input convolutions are always sized for the exact channel
+    count of the skip tensor that will be concatenated to them at that
+    point in `forward()`.
     """
 
     def __init__(
@@ -273,6 +344,9 @@ class ResidualUNet(nn.Module):
         # ---------------- Encoder ----------------
         self.down_blocks = nn.ModuleList()
         self.downsamples = nn.ModuleList()
+        # `channels` records one entry per skip tensor that forward() will
+        # push, in push order: one per residual block, plus one after each
+        # downsample (except after the final stage, which has none).
         channels = [base_channels]
         now_channels = base_channels
         current_res = 64  # nominal resolution tracker for attention placement (relative)
@@ -322,7 +396,13 @@ class ResidualUNet(nn.Module):
             else:
                 self.upsamples.append(None)
 
-        self.out_norm = nn.GroupNorm(min(8, now_channels), now_channels)
+        assert not channels, (
+            "Internal error: skip-channel bookkeeping did not fully "
+            f"unwind (leftover: {channels}). This should be unreachable; "
+            "encoder pushes and decoder pops must always balance."
+        )
+
+        self.out_norm = LayerNorm2d(now_channels)
         self.out_conv = nn.Conv2d(now_channels, hsi_channels, kernel_size=3, padding=1)
 
     def forward(
@@ -350,13 +430,25 @@ class ResidualUNet(nn.Module):
         x = torch.cat([noisy_residual, condition], dim=1)
         h = self.input_conv(x)
 
+        # One skip pushed for the input_conv output, matching the initial
+        # `channels = [base_channels]` entry in __init__.
         skips = [h]
         for stage_blocks, downsample in zip(self.down_blocks, self.downsamples):
             for block in stage_blocks:
-                h = block(h, time_emb) if isinstance(block, ResBlock) else block(h)
-            skips.append(h)
+                if isinstance(block, ResBlock):
+                    h = block(h, time_emb)
+                    # One skip push per residual block, matching the
+                    # per-block `channels.append(now_channels)` in
+                    # __init__. Attention blocks do not change the channel
+                    # count and therefore do not get their own skip.
+                    skips.append(h)
+                else:
+                    h = block(h)
             if downsample is not None:
                 h = downsample(h)
+                # One skip push per downsample, matching the
+                # `channels.append(now_channels)` call after each
+                # downsample in __init__.
                 skips.append(h)
 
         h = self.middle_block1(h, time_emb)
@@ -373,6 +465,11 @@ class ResidualUNet(nn.Module):
                     h = block(h)
             if upsample is not None:
                 h = upsample(h)
+
+        assert not skips, (
+            "Internal error: skip-connection stack was not fully consumed "
+            f"(leftover: {len(skips)} tensors). This should be unreachable."
+        )
 
         h = self.out_conv(F.silu(self.out_norm(h)))
         return h
