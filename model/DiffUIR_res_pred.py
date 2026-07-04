@@ -111,7 +111,7 @@ import torch.nn.functional as F
 # MST++ is assumed to already exist, fully implemented, in your codebase.
 # We only import and instantiate it here; its architecture is NOT
 # reimplemented in this file.
-from MST_Plus_Plus import MST_Plus_Plus  # noqa: F401  (placeholder import)
+from .MST_Plus_Plus import MST_Plus_Plus  # noqa: F401  (placeholder import)
 
 
 # ==========================================================================
