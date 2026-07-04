@@ -49,7 +49,7 @@ from torch.utils.data import DataLoader, Dataset
 
 # TODO: adjust this import to wherever you saved the ResShiftSSR model file
 # (the file that defines ResShiftDiffusion, ResShiftDenoiser and ResShiftSSR).
-from model.resshift import ResShiftSSR
+from models.resshift_ssr import ResShiftSSR
 
 from loss.mrae import mrae
 from loss.psnr import psnr
@@ -317,6 +317,31 @@ def convert_to_chw(
     )
 
 
+def align_hsi_orientation(
+    cube_chw: np.ndarray,
+    target_hw: Tuple[int, int],
+    file_path: Path,
+) -> np.ndarray:
+    """Transpose a [C,H,W] cube's spatial axes if needed to match target_hw.
+
+    Some HSI datasets (e.g. NTIRE / ARAD_1K) store the spectral cube with H
+    and W swapped relative to the paired RGB image. filter_valid_pairs()
+    already accepts such pairs; this function performs the actual correction
+    at load time so the crop/augmentation code always sees matching shapes.
+    """
+    current_hw = (cube_chw.shape[1], cube_chw.shape[2])
+
+    if current_hw == target_hw:
+        return cube_chw
+    if current_hw == (target_hw[1], target_hw[0]):
+        return np.transpose(cube_chw, (0, 2, 1))
+
+    raise ValueError(
+        f"Cannot align HSI spatial size {current_hw} in {file_path} with "
+        f"target size {target_hw}, even after transposing."
+    )
+
+
 def normalize_cube(cube: np.ndarray, mode: str) -> np.ndarray:
     if mode == "none":
         return cube
@@ -573,16 +598,26 @@ def inspect_pair(
 
     MATLAB files are checked from their headers/metadata so the complete cube
     is not loaded during the initial validation pass. RGB images are checked
-    from their headers using PIL. The two spatial resolutions must match.
+    from their headers using PIL.
+
+    Some HSI datasets (e.g. NTIRE / ARAD_1K) store the spectral cube with its
+    height and width transposed relative to the RGB image's orientation. A
+    pair is therefore accepted if the two spatial sizes match either directly
+    or with H/W swapped; the actual transpose (if needed) is corrected for at
+    load time in RGBHSIDataset.__getitem__ via align_hsi_orientation().
     """
     hsi_shape = inspect_hsi_shape(hsi_path, hsi_channels, hsi_key)
     hsi_h, hsi_w = get_hsi_spatial_dims(hsi_shape, hsi_channels)
     rgb_h, rgb_w = get_rgb_spatial_size(rgb_path)
 
-    if (hsi_h, hsi_w) != (rgb_h, rgb_w):
+    direct_match = (hsi_h, hsi_w) == (rgb_h, rgb_w)
+    transposed_match = (hsi_h, hsi_w) == (rgb_w, rgb_h)
+
+    if not (direct_match or transposed_match):
         raise ValueError(
             f"Spatial size mismatch between HSI {hsi_path} ({hsi_h}x{hsi_w}) "
-            f"and RGB {rgb_path} ({rgb_h}x{rgb_w})."
+            f"and RGB {rgb_path} ({rgb_h}x{rgb_w}) -- sizes don't match even "
+            f"when transposed."
         )
 
 
@@ -817,12 +852,18 @@ class RGBHSIDataset(Dataset):
         if not np.isfinite(cube).all():
             raise ValueError(f"NaN or Inf values found in {hsi_path}")
 
-        cube = normalize_cube(cube, self.normalization)
-        hsi_tensor = torch.from_numpy(np.ascontiguousarray(cube)).float()
-
         rgb_array = load_rgb_file(rgb_path)
         if not np.isfinite(rgb_array).all():
             raise ValueError(f"NaN or Inf values found in {rgb_path}")
+
+        # Correct for HSI/RGB orientation mismatches (e.g. NTIRE/ARAD_1K
+        # stores spectral cubes with H and W transposed relative to the RGB
+        # image) before normalization, cropping, or augmentation.
+        target_hw = (rgb_array.shape[1], rgb_array.shape[2])
+        cube = align_hsi_orientation(cube, target_hw, hsi_path)
+
+        cube = normalize_cube(cube, self.normalization)
+        hsi_tensor = torch.from_numpy(np.ascontiguousarray(cube)).float()
         rgb_tensor = torch.from_numpy(np.ascontiguousarray(rgb_array)).float()
 
         if rgb_tensor.shape[-2:] != hsi_tensor.shape[-2:]:
