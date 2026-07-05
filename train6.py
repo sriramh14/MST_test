@@ -40,6 +40,19 @@ Key behaviour
    final training epoch, since it is far more expensive; its metrics are
    saved in the final checkpoint and printed at the end of the run.
 
+Modes
+-----
+This script takes exactly one command-line argument, the run mode:
+
+    python train_residual_diffusion.py train
+    python train_residual_diffusion.py compare
+
+`train` runs the full training loop, unchanged from the original script.
+`compare` loads the best checkpoint saved by a previous `train` run and
+reports a band-to-band comparison (per spectral band mrae/rmse/psnr/ssim)
+between the fully diffusion-refined reconstruction and the ground-truth HSI
+cube on the validation split, in addition to the usual whole-cube metrics.
+
 Compatibility note
 -------------------
 This script was checked against the corrected `ResidualDiffusionRGB2HSI`
@@ -56,10 +69,11 @@ model.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import random
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import h5py
 import numpy as np
@@ -194,18 +208,19 @@ VALIDATION_CACHE = Path(OUTPUT_DIR) / "resshift_validation_cache.pth"
 HSI_CHECKER_VERSION = "resshift-rgb-hsi-pair-cache-v1"
 
 # =============================================================================
-# Inference configuration
+# Band-to-band comparison mode ("compare")
 # =============================================================================
 
-# Defaults used by `python this_script.py infer ...` when the corresponding
-# CLI flag is not supplied. All of these can be overridden on the command
-# line; see `build_arg_parser()` / `run_inference_cli()` below.
-INFER_CHECKPOINT_PATH = str(Path(OUTPUT_DIR) / "best_residual_diffusion.pth")
-INFER_INPUT_DIR = RGB_DATA_DIR
-INFER_OUTPUT_DIR = "./residual_diffusion_predictions"
-INFER_SAVE_FORMAT = "mat"  # "mat" or "npy"
-INFER_SAVE_COARSE = False  # also save the frozen MST++ prediction (y0)
-INFER_GT_HSI_DIR: Optional[str] = None  # optional, for reporting metrics only
+# Checkpoint used by `compare` mode. This is the best checkpoint produced by
+# `train` mode (selected on single-step validation MRAE -- see the
+# save_checkpoint() calls inside main()).
+COMPARE_CHECKPOINT_PATH = Path(OUTPUT_DIR) / "best_residual_diffusion.pth"
+BAND_COMPARISON_CSV = Path(OUTPUT_DIR) / "band_comparison.csv"
+
+# Number of validation images `compare` mode runs the (expensive) full
+# diffusion reconstruction on. Kept small since full reverse sampling is far
+# more costly than a single forward pass.
+NUM_COMPARE_IMAGES = 5
 
 
 # =============================================================================
@@ -1110,6 +1125,42 @@ def _empty_metric_totals() -> Dict[str, float]:
     return {"mrae": 0.0, "rmse": 0.0, "sam": 0.0, "psnr": 0.0, "ssim": 0.0}
 
 
+@torch.no_grad()
+def compute_band_metrics(
+    reconstruction: torch.Tensor,
+    target: torch.Tensor,
+) -> Dict[str, List[float]]:
+    """Per-band mrae / rmse / psnr / ssim between a reconstruction and its
+    ground truth, for a [B, HSI_CHANNELS, H, W] pair.
+
+    Spectral angle (sam) is intentionally left out here: it is only a
+    meaningful quantity across a full spectral vector, not for a single
+    isolated band, so it continues to be reported only as a whole-cube
+    metric via calculate_metrics().
+    """
+    if reconstruction.shape != target.shape:
+        raise ValueError(
+            f"Shape mismatch in compute_band_metrics: "
+            f"{tuple(reconstruction.shape)} vs {tuple(target.shape)}"
+        )
+
+    reconstruction = reconstruction.float()
+    target = target.float()
+    num_bands = reconstruction.shape[1]
+
+    per_band: Dict[str, List[float]] = {"mrae": [], "rmse": [], "psnr": [], "ssim": []}
+    for band in range(num_bands):
+        band_reconstruction = reconstruction[:, band : band + 1]
+        band_target = target[:, band : band + 1]
+
+        per_band["mrae"].append(float(mrae(band_target, band_reconstruction).item()))
+        per_band["rmse"].append(float(rmse(band_target, band_reconstruction).item()))
+        per_band["psnr"].append(float(psnr(band_target, band_reconstruction).item()))
+        per_band["ssim"].append(float(ssim(band_target, band_reconstruction).item()))
+
+    return per_band
+
+
 # =============================================================================
 # Training and validation
 # =============================================================================
@@ -1314,391 +1365,204 @@ def save_checkpoint(
 
 
 # =============================================================================
-# Inference
+# Band-to-band comparison mode ("compare")
 # =============================================================================
 
 
-def build_model_from_checkpoint(
-    checkpoint: Dict[str, Any],
-    device: torch.device,
-) -> ResidualDiffusionRGB2HSI:
-    """Reconstruct a ResidualDiffusionRGB2HSI from a saved checkpoint.
-
-    Falls back to the module-level architecture constants above for any
-    field that an older checkpoint (saved before this key existed) might be
-    missing, so checkpoints from earlier versions of this script still load.
-    """
-    config = checkpoint.get("model_config", {})
-
-    model = ResidualDiffusionRGB2HSI(
-        rgb_channels=config.get("rgb_channels", RGB_CHANNELS),
-        hsi_channels=config.get("hsi_channels", HSI_CHANNELS),
-        num_timesteps=config.get("num_timesteps", DIFFUSION_T),
-        unet_base_channels=config.get("unet_base_channels", UNET_BASE_CHANNELS),
-        unet_channel_multipliers=tuple(
-            config.get("unet_channel_multipliers", UNET_CHANNEL_MULTIPLIERS)
-        ),
-        unet_num_res_blocks=config.get("unet_num_res_blocks", UNET_NUM_RES_BLOCKS),
-        unet_attention_resolutions=tuple(
-            config.get("unet_attention_resolutions", UNET_ATTENTION_RESOLUTIONS)
-        ),
-        unet_dropout=config.get("unet_dropout", UNET_DROPOUT),
-        alpha_bar_max=config.get("diffusion_alpha_bar_max", DIFFUSION_ALPHA_BAR_MAX),
-        beta_bar_min=config.get("diffusion_beta_bar_min", DIFFUSION_BETA_BAR_MIN),
-        beta_bar_max=config.get("diffusion_beta_bar_max", DIFFUSION_BETA_BAR_MAX),
-        delta_bar_max=config.get("diffusion_delta_bar_max", DIFFUSION_DELTA_BAR_MAX),
-        schedule_type=config.get("diffusion_schedule_type", DIFFUSION_SCHEDULE_TYPE),
+def build_model(device: torch.device) -> ResidualDiffusionRGB2HSI:
+    """Construct the model architecture (weights are loaded separately)."""
+    return ResidualDiffusionRGB2HSI(
+        rgb_channels=RGB_CHANNELS,
+        hsi_channels=HSI_CHANNELS,
+        num_timesteps=DIFFUSION_T,
+        unet_base_channels=UNET_BASE_CHANNELS,
+        unet_channel_multipliers=UNET_CHANNEL_MULTIPLIERS,
+        unet_num_res_blocks=UNET_NUM_RES_BLOCKS,
+        unet_attention_resolutions=UNET_ATTENTION_RESOLUTIONS,
+        unet_dropout=UNET_DROPOUT,
+        alpha_bar_max=DIFFUSION_ALPHA_BAR_MAX,
+        beta_bar_min=DIFFUSION_BETA_BAR_MIN,
+        beta_bar_max=DIFFUSION_BETA_BAR_MAX,
+        delta_bar_max=DIFFUSION_DELTA_BAR_MAX,
+        schedule_type=DIFFUSION_SCHEDULE_TYPE,
     ).to(device)
 
+
+def load_model_for_comparison(device: torch.device) -> ResidualDiffusionRGB2HSI:
+    """Build the model and load the trained weights used by `compare` mode."""
+    if not COMPARE_CHECKPOINT_PATH.exists():
+        raise FileNotFoundError(
+            f"No checkpoint found at {COMPARE_CHECKPOINT_PATH}. "
+            f"Run this script in 'train' mode first."
+        )
+
+    model = build_model(device)
+
+    try:
+        checkpoint = torch.load(COMPARE_CHECKPOINT_PATH, map_location=device, weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(COMPARE_CHECKPOINT_PATH, map_location=device)
+
     model.load_state_dict(checkpoint["model_state_dict"])
-    # MST++ is already frozen by the model's own constructor; this is just a
-    # safety re-assertion, mirroring main()'s behaviour after weight loading.
+
+    # MST++ is already frozen inside the model itself; re-asserting this
+    # after loading weights adds no new behaviour, it just guards against a
+    # checkpoint that happened to store requires_grad state.
     model._freeze_mst_plus_plus()
     model.eval()
+
+    print(
+        f"Loaded checkpoint for comparison: {COMPARE_CHECKPOINT_PATH} "
+        f"(epoch {checkpoint.get('epoch', '?')})"
+    )
     return model
 
 
-def load_model_for_inference(
-    checkpoint_path: str,
-    device: torch.device,
-) -> Tuple[ResidualDiffusionRGB2HSI, Dict[str, Any]]:
-    checkpoint_file = Path(checkpoint_path)
-    if not checkpoint_file.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_file}")
+def print_and_save_band_comparison(
+    per_band_totals: Dict[str, List[float]],
+    image_count: int,
+    csv_path: Path,
+) -> None:
+    """Average per-band metric totals over the validation set, print a
+    band-by-band table, and save it as a CSV file."""
+    num_bands = len(per_band_totals["mrae"])
+    averaged = {
+        name: [value / max(image_count, 1) for value in values]
+        for name, values in per_band_totals.items()
+    }
 
-    try:
-        checkpoint = torch.load(checkpoint_file, map_location=device, weights_only=False)
-    except TypeError:
-        checkpoint = torch.load(checkpoint_file, map_location=device)
+    print("\nBand-by-band comparison (reconstruction vs. ground-truth HSI):")
+    print(f"{'Band':>6} | {'MRAE':>10} | {'RMSE':>10} | {'PSNR':>10} | {'SSIM':>10}")
+    print("-" * 58)
+    for band in range(num_bands):
+        print(
+            f"{band + 1:>6} | "
+            f"{averaged['mrae'][band]:>10.6f} | "
+            f"{averaged['rmse'][band]:>10.6f} | "
+            f"{averaged['psnr'][band]:>10.4f} | "
+            f"{averaged['ssim'][band]:>10.4f}"
+        )
 
-    model = build_model_from_checkpoint(checkpoint, device)
-
-    print(f"Loaded checkpoint: {checkpoint_file}")
-    print(f"  Epoch: {checkpoint.get('epoch', 'unknown')}")
-    quick = checkpoint.get("quick_validation_metrics")
-    if quick:
-        print(f"  Checkpoint's single-step validation MRAE: {quick.get('mrae', float('nan')):.6f}")
-
-    return model, checkpoint
-
-
-def save_hsi_cube(cube_chw: np.ndarray, output_path: Path, save_format: str) -> None:
-    """Save an [C,H,W] HSI cube to disk as either .mat (key 'cube') or .npy."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if save_format == "mat":
-        sio.savemat(str(output_path), {HSI_KEY: cube_chw})
-    elif save_format == "npy":
-        np.save(str(output_path), cube_chw)
-    else:
-        raise ValueError(f"Unknown save format: {save_format}")
-
-
-def discover_inference_inputs(input_path: str) -> List[Path]:
-    """Accept either a single RGB image file or a directory of RGB images."""
-    path = Path(input_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Inference input not found: {path}")
-
-    if path.is_file():
-        if path.suffix.lower() not in SUPPORTED_RGB_EXTENSIONS:
-            raise ValueError(
-                f"{path} does not have a supported RGB extension "
-                f"({sorted(SUPPORTED_RGB_EXTENSIONS)})"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["band", "mrae", "rmse", "psnr", "ssim"])
+        for band in range(num_bands):
+            writer.writerow(
+                [
+                    band + 1,
+                    averaged["mrae"][band],
+                    averaged["rmse"][band],
+                    averaged["psnr"][band],
+                    averaged["ssim"][band],
+                ]
             )
-        return [path]
-
-    return find_files_with_extensions(input_path, SUPPORTED_RGB_EXTENSIONS)
+    print(f"\nBand-by-band comparison saved to: {csv_path}")
 
 
 @torch.no_grad()
-def run_inference(
-    model: ResidualDiffusionRGB2HSI,
-    input_path: str,
-    output_dir: str,
-    device: torch.device,
-    use_amp: bool,
-    save_format: str = INFER_SAVE_FORMAT,
-    save_coarse: bool = INFER_SAVE_COARSE,
-    gt_hsi_dir: Optional[str] = INFER_GT_HSI_DIR,
-    num_sampling_steps: int = NUM_SAMPLING_STEPS,
-    use_ddim_sampling: bool = USE_DDIM_SAMPLING,
-) -> Dict[str, float]:
-    """Run full reverse-diffusion inference on one RGB image or a directory.
+def compare_bands() -> None:
+    """`compare` mode: run the fully diffusion-refined reconstruction on the
+    validation split and report a band-to-band comparison against the
+    ground-truth HSI, alongside the usual whole-cube mrae/rmse/sam/psnr/ssim.
 
-    For every RGB input this predicts the fine HSI cube with
-    `diffusion_full_sample()` (the same multi-step DDIM/DDPM reverse
-    sampling used once at the end of training) and saves it next to the
-    coarse MST++ prediction if `save_coarse` is set.
-
-    If `gt_hsi_dir` is given, ground-truth cubes with a matching file stem
-    are loaded (via the same `load_hsi_file` / `align_hsi_orientation`
-    helpers used for training) purely to report mrae/rmse/sam/psnr/ssim;
-    they are never required for making a prediction.
-
-    Returns the averaged metrics across all inputs with an available ground
-    truth (empty dict if none was found).
+    Uses the same file discovery / pairing / validation split logic as
+    `main()` (same SEED, so it reproduces the exact same validation split
+    used during training), and the same full multi-step reverse-diffusion
+    sampling that is run once at the end of training
+    (diffusion_full_sample()).
     """
-    model.eval()
-
-    rgb_paths = discover_inference_inputs(input_path)
-    output_root = Path(output_dir)
-    output_root.mkdir(parents=True, exist_ok=True)
-
-    metric_totals = _empty_metric_totals()
-    metric_count = 0
-
-    print(f"\nRunning inference on {len(rgb_paths)} RGB image(s)")
-    print(f"Sampling steps: {num_sampling_steps} | DDIM: {use_ddim_sampling}")
-    print(f"Saving predictions to: {output_root}")
-
-    for index, rgb_path in enumerate(rgb_paths, start=1):
-        rgb_array = load_rgb_file(rgb_path)
-        if not np.isfinite(rgb_array).all():
-            print(f"  Skipping {rgb_path.name}: NaN or Inf values in RGB input")
-            continue
-
-        rgb_tensor = torch.from_numpy(np.ascontiguousarray(rgb_array)).float()
-        rgb_tensor = rgb_tensor.unsqueeze(0).to(device, non_blocking=True)
-
-        with autocast(enabled=use_amp):
-            padded_rgb, (height, width) = pad_to_multiple(rgb_tensor, MODEL_DOWNSAMPLE_FACTOR)
-            fine_hsi_padded = model.sample(
-                padded_rgb,
-                num_sampling_steps=num_sampling_steps,
-                use_ddim=use_ddim_sampling,
-            )
-            y0_padded = model.get_coarse_prediction(padded_rgb)
-
-        fine_hsi = fine_hsi_padded[..., :height, :width].float()
-        y0 = y0_padded[..., :height, :width].float()
-
-        fine_hsi_np = fine_hsi.squeeze(0).cpu().numpy()
-        save_hsi_cube(
-            fine_hsi_np,
-            output_root / f"{rgb_path.stem}_pred.{save_format}",
-            save_format,
-        )
-        if save_coarse:
-            save_hsi_cube(
-                y0.squeeze(0).cpu().numpy(),
-                output_root / f"{rgb_path.stem}_coarse.{save_format}",
-                save_format,
-            )
-
-        status = f"  [{index:04d}/{len(rgb_paths):04d}] {rgb_path.name} -> saved"
-
-        if gt_hsi_dir is not None:
-            gt_candidates = [
-                candidate
-                for candidate in find_files_with_extensions(gt_hsi_dir, SUPPORTED_HSI_EXTENSIONS)
-                if candidate.stem == rgb_path.stem
-            ]
-            if gt_candidates:
-                gt_cube = load_hsi_file(gt_candidates[0], HSI_KEY)
-                gt_cube = convert_to_chw(gt_cube, HSI_CHANNELS, gt_candidates[0])
-                gt_cube = align_hsi_orientation(
-                    gt_cube, (rgb_array.shape[1], rgb_array.shape[2]), gt_candidates[0]
-                )
-                gt_tensor = (
-                    torch.from_numpy(np.ascontiguousarray(gt_cube))
-                    .float()
-                    .unsqueeze(0)
-                    .to(device)
-                )
-                metrics = calculate_metrics(fine_hsi, gt_tensor)
-                for name, value in metrics.items():
-                    metric_totals[name] += value
-                metric_count += 1
-                status += (
-                    f" | MRAE: {metrics['mrae']:.4f} | PSNR: {metrics['psnr']:.2f} "
-                    f"| SAM: {metrics['sam']:.4f}"
-                )
-
-        print(status)
-
-    averaged_metrics = (
-        {name: value / metric_count for name, value in metric_totals.items()}
-        if metric_count > 0
-        else {}
-    )
-
-    if averaged_metrics:
-        print(
-            f"\nAverage metrics over {metric_count} image(s) with ground truth:\n"
-            f"  MRAE: {averaged_metrics['mrae']:.6f} | "
-            f"RMSE: {averaged_metrics['rmse']:.6f} | "
-            f"SAM: {averaged_metrics['sam']:.6f} | "
-            f"PSNR: {averaged_metrics['psnr']:.4f} | "
-            f"SSIM: {averaged_metrics['ssim']:.4f}"
-        )
-    elif gt_hsi_dir is not None:
-        print("\nNo matching ground-truth HSI cubes were found; no metrics computed.")
-
-    return averaged_metrics
-
-
-def run_inference_cli(args: argparse.Namespace) -> None:
+    set_seed(SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = USE_AMP and device.type == "cuda"
 
-    model, _checkpoint = load_model_for_inference(args.checkpoint, device)
+    output_dir = Path(OUTPUT_DIR)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    run_inference(
-        model=model,
-        input_path=args.input,
-        output_dir=args.output,
-        device=device,
-        use_amp=use_amp,
-        save_format=args.save_format,
-        save_coarse=args.save_coarse,
-        gt_hsi_dir=args.gt_hsi_dir,
-        num_sampling_steps=args.sampling_steps,
-        use_ddim_sampling=not args.no_ddim,
+    all_pairs = find_paired_files(HSI_DATA_DIR, RGB_DATA_DIR)
+    all_pairs = filter_valid_pairs(
+        pairs=all_pairs,
+        hsi_channels=HSI_CHANNELS,
+        hsi_key=HSI_KEY,
+        log_path=output_dir / "invalid_pairs.txt",
     )
+    _training_pairs, validation_pairs = split_pairs(all_pairs, VALIDATION_FRACTION, SEED)
 
-
-# =============================================================================
-# Dataset visualisation (sanity-check a handful of random RGB/HSI pairs)
-# =============================================================================
-
-# Defaults used by `python this_script.py visualize ...` when the
-# corresponding CLI flag is not supplied.
-VISUALIZE_NUM_IMAGES = 5
-VISUALIZE_OUTPUT_PATH = str(Path(OUTPUT_DIR) / "dataset_preview.png")
-
-# Which HSI bands to average together to build a human-viewable "false
-# colour" composite (NTIRE/ARAD_1K cubes run roughly 400-700nm across 31
-# bands, so the low/middle/high thirds approximate blue/green/red).
-_HSI_FALSE_COLOR_BAND_FRACTIONS = ((0.75, 0.95), (0.45, 0.65), (0.05, 0.25))
-
-
-def hsi_cube_to_false_color(cube_chw: np.ndarray) -> np.ndarray:
-    """Turn a [C,H,W] HSI cube into a viewable [H,W,3] false-colour image.
-
-    Each output channel is the mean of a band range spread across the
-    spectrum (see `_HSI_FALSE_COLOR_BAND_FRACTIONS`), then the whole image
-    is min-max stretched to [0, 1] purely for display -- this does not
-    affect anything used in training.
-    """
-    num_bands = cube_chw.shape[0]
-    channels = []
-
-    for low_fraction, high_fraction in _HSI_FALSE_COLOR_BAND_FRACTIONS:
-        low_index = int(round(low_fraction * (num_bands - 1)))
-        high_index = int(round(high_fraction * (num_bands - 1)))
-        low_index, high_index = sorted((low_index, high_index))
-        channels.append(cube_chw[low_index : high_index + 1].mean(axis=0))
-
-    composite = np.stack(channels, axis=-1)
-    minimum = composite.min()
-    maximum = composite.max()
-    composite = (composite - minimum) / (maximum - minimum + 1e-8)
-    return composite
-
-
-def select_random_pairs(
-    pairs: Sequence[Tuple[Path, Path]],
-    num_images: int,
-    seed: Optional[int] = None,
-) -> List[Tuple[Path, Path]]:
-    """Pick `num_images` distinct random HSI/RGB pairs to preview."""
-    if not pairs:
-        raise RuntimeError("No HSI/RGB pairs available to visualise.")
-
-    sample_size = min(num_images, len(pairs))
-    rng = random.Random(seed) if seed is not None else random
-    return rng.sample(list(pairs), sample_size)
-
-
-def visualize_random_pairs(
-    pairs: Sequence[Tuple[Path, Path]],
-    num_images: int,
-    output_path: str,
-    seed: Optional[int] = None,
-) -> Path:
-    """Save a figure previewing `num_images` random RGB/HSI pairs.
-
-    For every sampled pair this shows, side by side:
-      - the RGB photo, as a human would normally see it, and
-      - a false-colour composite of the paired HSI cube (built by
-        averaging low/mid/high spectral bands into blue/green/red so the
-        31-band cube becomes viewable), with the number of bands and the
-        image resolution captioned underneath.
-
-    This is a read-only sanity check -- it does not touch training,
-    validation, checkpoints, or any of the loss/metric computations above.
-    """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    chosen_pairs = select_random_pairs(pairs, num_images, seed=seed)
-
-    figure, axes = plt.subplots(
-        len(chosen_pairs), 2, figsize=(8, 4 * len(chosen_pairs)), squeeze=False
-    )
-
-    for row, (hsi_path, rgb_path) in enumerate(chosen_pairs):
-        rgb_array = load_rgb_file(rgb_path)  # [3,H,W] in [0,1]
-        rgb_image = np.transpose(rgb_array, (1, 2, 0))
-
-        cube = load_hsi_file(hsi_path, HSI_KEY)
-        cube = convert_to_chw(cube, HSI_CHANNELS, hsi_path)
-        cube = align_hsi_orientation(
-            cube, (rgb_array.shape[1], rgb_array.shape[2]), hsi_path
+    comparison_pairs = validation_pairs[:NUM_COMPARE_IMAGES]
+    if len(comparison_pairs) < NUM_COMPARE_IMAGES:
+        print(
+            f"\nWarning: only {len(comparison_pairs)} validation pair(s) available, "
+            f"fewer than NUM_COMPARE_IMAGES ({NUM_COMPARE_IMAGES}). Using all of them."
         )
-        false_color_image = hsi_cube_to_false_color(cube)
 
-        left_axis, right_axis = axes[row]
-
-        left_axis.imshow(np.clip(rgb_image, 0.0, 1.0))
-        left_axis.set_title(f"RGB: {rgb_path.name}", fontsize=10)
-        left_axis.axis("off")
-
-        right_axis.imshow(np.clip(false_color_image, 0.0, 1.0))
-        right_axis.set_title(
-            f"HSI (false colour): {hsi_path.name}\n"
-            f"{cube.shape[0]} bands, {cube.shape[1]}x{cube.shape[2]} px",
-            fontsize=10,
-        )
-        right_axis.axis("off")
-
-    figure.suptitle(
-        f"Random preview of {len(chosen_pairs)} RGB/HSI pair(s) from the dataset",
-        fontsize=12,
+    print(f"\nDevice: {device}")
+    print(
+        f"Comparing on {len(comparison_pairs)} of {len(validation_pairs)} "
+        f"validation pair(s) (NUM_COMPARE_IMAGES = {NUM_COMPARE_IMAGES})."
     )
-    figure.tight_layout()
 
-    output_file = Path(output_path)
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output_file, dpi=150, bbox_inches="tight")
-    plt.close(figure)
-
-    print(f"\nSaved a preview of {len(chosen_pairs)} random RGB/HSI pair(s) to: {output_file}")
-    for hsi_path, rgb_path in chosen_pairs:
-        print(f"  RGB: {rgb_path}\n  HSI: {hsi_path}")
-
-    return output_file
-
-
-def run_visualization_cli(args: argparse.Namespace) -> None:
-    """Entry point for `python this_script.py visualize ...`.
-
-    Discovers RGB/HSI pairs from HSI_DATA_DIR/RGB_DATA_DIR (the same
-    directories and pairing logic used for training), picks a random subset,
-    and saves a side-by-side preview image. This never loads the model and
-    never touches training/validation/checkpointing code.
-    """
-    pairs = find_paired_files(HSI_DATA_DIR, RGB_DATA_DIR)
-    print(f"Found {len(pairs)} total HSI/RGB pairs in the dataset directories.")
-
-    visualize_random_pairs(
-        pairs=pairs,
-        num_images=args.num_images,
-        output_path=args.output,
-        seed=args.seed,
+    validation_dataset = RGBHSIDataset(
+        pairs=comparison_pairs,
+        hsi_channels=HSI_CHANNELS,
+        training=False,
+        normalization=NORMALIZATION,
+        crop_size=None,
+        crops_per_image=1,
+        augment=False,
     )
+    validation_loader = DataLoader(
+        validation_dataset,
+        batch_size=VALIDATION_BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=device.type == "cuda",
+        drop_last=False,
+    )
+
+    model = load_model_for_comparison(device)
+
+    whole_cube_totals = _empty_metric_totals()
+    per_band_totals: Dict[str, List[float]] = {
+        "mrae": [0.0] * HSI_CHANNELS,
+        "rmse": [0.0] * HSI_CHANNELS,
+        "psnr": [0.0] * HSI_CHANNELS,
+        "ssim": [0.0] * HSI_CHANNELS,
+    }
+    image_count = 0
+
+    for rgb, hsi in validation_loader:
+        rgb = rgb.to(device, non_blocking=True)
+        hsi = hsi.to(device, non_blocking=True)
+
+        with autocast(enabled=use_amp):
+            fine_hsi, _y0 = diffusion_full_sample(model, rgb)
+
+        image_count += 1
+
+        for name, value in calculate_metrics(fine_hsi, hsi).items():
+            whole_cube_totals[name] += value
+
+        band_metrics = compute_band_metrics(fine_hsi, hsi)
+        for name, values in band_metrics.items():
+            for band, value in enumerate(values):
+                per_band_totals[name][band] += value
+
+        print(f"  Compared {image_count}/{len(validation_loader)} validation image(s)")
+
+    whole_cube_metrics = {
+        name: value / max(image_count, 1) for name, value in whole_cube_totals.items()
+    }
+    print(
+        "\nWhole-cube validation metrics (fully diffusion-refined reconstruction "
+        "vs. ground-truth HSI):\n"
+        f"  MRAE: {whole_cube_metrics['mrae']:.6f} | "
+        f"RMSE: {whole_cube_metrics['rmse']:.6f} | "
+        f"SAM: {whole_cube_metrics['sam']:.6f} | "
+        f"PSNR: {whole_cube_metrics['psnr']:.4f} | "
+        f"SSIM: {whole_cube_metrics['ssim']:.4f}"
+    )
+
+    print_and_save_band_comparison(per_band_totals, image_count, BAND_COMPARISON_CSV)
 
 
 # =============================================================================
@@ -1795,21 +1659,7 @@ def main() -> None:
         worker_init_fn=seed_worker,
     )
 
-    model = ResidualDiffusionRGB2HSI(
-        rgb_channels=RGB_CHANNELS,
-        hsi_channels=HSI_CHANNELS,
-        num_timesteps=DIFFUSION_T,
-        unet_base_channels=UNET_BASE_CHANNELS,
-        unet_channel_multipliers=UNET_CHANNEL_MULTIPLIERS,
-        unet_num_res_blocks=UNET_NUM_RES_BLOCKS,
-        unet_attention_resolutions=UNET_ATTENTION_RESOLUTIONS,
-        unet_dropout=UNET_DROPOUT,
-        alpha_bar_max=DIFFUSION_ALPHA_BAR_MAX,
-        beta_bar_min=DIFFUSION_BETA_BAR_MIN,
-        beta_bar_max=DIFFUSION_BETA_BAR_MAX,
-        delta_bar_max=DIFFUSION_DELTA_BAR_MAX,
-        schedule_type=DIFFUSION_SCHEDULE_TYPE,
-    ).to(device)
+    model = build_model(device)
 
     if MST_CKPT_PATH is not None:
         # The model file itself does not load MST++ weights (by design, per
@@ -1976,119 +1826,32 @@ def main() -> None:
             )
 
 
-# =============================================================================
-# CLI entry point
-# =============================================================================
-
-
-def build_arg_parser() -> argparse.ArgumentParser:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Train the residual diffusion RGB->HSI model, or run inference "
-            "with a saved checkpoint."
+            "Train the residual diffusion RGB->HSI model, or compare an "
+            "already-trained model's reconstruction against ground-truth "
+            "HSI on a band-by-band basis."
         )
     )
-    subparsers = parser.add_subparsers(dest="mode")
-
-    subparsers.add_parser(
-        "train",
-        help="Train the model using the configuration constants at the top of this file.",
-    )
-
-    infer_parser = subparsers.add_parser(
-        "infer",
-        help="Run full reverse-diffusion inference on one RGB image or a directory of RGB images.",
-    )
-    infer_parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default=INFER_CHECKPOINT_PATH,
-        help=f"Path to a .pth checkpoint saved by this script (default: {INFER_CHECKPOINT_PATH})",
-    )
-    infer_parser.add_argument(
-        "--input",
-        type=str,
-        default=INFER_INPUT_DIR,
-        help="Path to a single RGB image file or a directory of RGB images.",
-    )
-    infer_parser.add_argument(
-        "--output",
-        type=str,
-        default=INFER_OUTPUT_DIR,
-        help=f"Directory to save predicted HSI cubes to (default: {INFER_OUTPUT_DIR})",
-    )
-    infer_parser.add_argument(
-        "--save-format",
-        type=str,
-        choices=["mat", "npy"],
-        default=INFER_SAVE_FORMAT,
-        help="File format for saved HSI cubes.",
-    )
-    infer_parser.add_argument(
-        "--save-coarse",
-        action="store_true",
-        default=INFER_SAVE_COARSE,
-        help="Also save the frozen MST++ coarse prediction (y0) for each input.",
-    )
-    infer_parser.add_argument(
-        "--gt-hsi-dir",
-        type=str,
-        default=INFER_GT_HSI_DIR,
+    parser.add_argument(
+        "mode",
+        choices=["train", "compare"],
         help=(
-            "Optional directory of ground-truth HSI cubes (matched to RGB "
-            "inputs by file stem) used only to report mrae/rmse/sam/psnr/ssim."
+            "'train': run the full training loop, unchanged from before. "
+            "'compare': load the best checkpoint saved by a previous "
+            "'train' run and report a band-to-band comparison (plus "
+            "whole-cube metrics) between the reconstruction and the "
+            "ground-truth HSI on the validation split."
         ),
     )
-    infer_parser.add_argument(
-        "--sampling-steps",
-        type=int,
-        default=NUM_SAMPLING_STEPS,
-        help=f"Number of reverse-diffusion sampling steps (default: {NUM_SAMPLING_STEPS})",
-    )
-    infer_parser.add_argument(
-        "--no-ddim",
-        action="store_true",
-        help="Use full DDPM ancestral sampling instead of DDIM.",
-    )
-
-    visualize_parser = subparsers.add_parser(
-        "visualize",
-        help=(
-            "Preview a handful of random RGB/HSI pairs from the dataset "
-            "directories as a side-by-side image (RGB photo vs. false-colour "
-            "HSI). Does not load the model or touch training/checkpoints."
-        ),
-    )
-    visualize_parser.add_argument(
-        "--num-images",
-        type=int,
-        default=VISUALIZE_NUM_IMAGES,
-        help=f"How many random pairs to preview (default: {VISUALIZE_NUM_IMAGES})",
-    )
-    visualize_parser.add_argument(
-        "--output",
-        type=str,
-        default=VISUALIZE_OUTPUT_PATH,
-        help=f"Where to save the preview image (default: {VISUALIZE_OUTPUT_PATH})",
-    )
-    visualize_parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Optional random seed, for a reproducible choice of preview images.",
-    )
-
-    return parser
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    cli_args = build_arg_parser().parse_args()
+    args = parse_args()
 
-    if cli_args.mode == "infer":
-        run_inference_cli(cli_args)
-    elif cli_args.mode == "visualize":
-        run_visualization_cli(cli_args)
-    else:
-        # Default to training when no subcommand (or "train") is given, so
-        # `python this_script.py` keeps working exactly as before.
+    if args.mode == "train":
         main()
+    else:
+        compare_bands()
