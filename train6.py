@@ -55,10 +55,11 @@ model.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import random
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import h5py
 import numpy as np
@@ -191,6 +192,20 @@ SAM_WARMUP_EPOCHS = 30
 # epoch.
 VALIDATION_CACHE = Path(OUTPUT_DIR) / "resshift_validation_cache.pth"
 HSI_CHECKER_VERSION = "resshift-rgb-hsi-pair-cache-v1"
+
+# =============================================================================
+# Inference configuration
+# =============================================================================
+
+# Defaults used by `python this_script.py infer ...` when the corresponding
+# CLI flag is not supplied. All of these can be overridden on the command
+# line; see `build_arg_parser()` / `run_inference_cli()` below.
+INFER_CHECKPOINT_PATH = str(Path(OUTPUT_DIR) / "best_residual_diffusion.pth")
+INFER_INPUT_DIR = RGB_DATA_DIR
+INFER_OUTPUT_DIR = "./residual_diffusion_predictions"
+INFER_SAVE_FORMAT = "mat"  # "mat" or "npy"
+INFER_SAVE_COARSE = False  # also save the frozen MST++ prediction (y0)
+INFER_GT_HSI_DIR: Optional[str] = None  # optional, for reporting metrics only
 
 
 # =============================================================================
@@ -1299,6 +1314,251 @@ def save_checkpoint(
 
 
 # =============================================================================
+# Inference
+# =============================================================================
+
+
+def build_model_from_checkpoint(
+    checkpoint: Dict[str, Any],
+    device: torch.device,
+) -> ResidualDiffusionRGB2HSI:
+    """Reconstruct a ResidualDiffusionRGB2HSI from a saved checkpoint.
+
+    Falls back to the module-level architecture constants above for any
+    field that an older checkpoint (saved before this key existed) might be
+    missing, so checkpoints from earlier versions of this script still load.
+    """
+    config = checkpoint.get("model_config", {})
+
+    model = ResidualDiffusionRGB2HSI(
+        rgb_channels=config.get("rgb_channels", RGB_CHANNELS),
+        hsi_channels=config.get("hsi_channels", HSI_CHANNELS),
+        num_timesteps=config.get("num_timesteps", DIFFUSION_T),
+        unet_base_channels=config.get("unet_base_channels", UNET_BASE_CHANNELS),
+        unet_channel_multipliers=tuple(
+            config.get("unet_channel_multipliers", UNET_CHANNEL_MULTIPLIERS)
+        ),
+        unet_num_res_blocks=config.get("unet_num_res_blocks", UNET_NUM_RES_BLOCKS),
+        unet_attention_resolutions=tuple(
+            config.get("unet_attention_resolutions", UNET_ATTENTION_RESOLUTIONS)
+        ),
+        unet_dropout=config.get("unet_dropout", UNET_DROPOUT),
+        alpha_bar_max=config.get("diffusion_alpha_bar_max", DIFFUSION_ALPHA_BAR_MAX),
+        beta_bar_min=config.get("diffusion_beta_bar_min", DIFFUSION_BETA_BAR_MIN),
+        beta_bar_max=config.get("diffusion_beta_bar_max", DIFFUSION_BETA_BAR_MAX),
+        delta_bar_max=config.get("diffusion_delta_bar_max", DIFFUSION_DELTA_BAR_MAX),
+        schedule_type=config.get("diffusion_schedule_type", DIFFUSION_SCHEDULE_TYPE),
+    ).to(device)
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+    # MST++ is already frozen by the model's own constructor; this is just a
+    # safety re-assertion, mirroring main()'s behaviour after weight loading.
+    model._freeze_mst_plus_plus()
+    model.eval()
+    return model
+
+
+def load_model_for_inference(
+    checkpoint_path: str,
+    device: torch.device,
+) -> Tuple[ResidualDiffusionRGB2HSI, Dict[str, Any]]:
+    checkpoint_file = Path(checkpoint_path)
+    if not checkpoint_file.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_file}")
+
+    try:
+        checkpoint = torch.load(checkpoint_file, map_location=device, weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(checkpoint_file, map_location=device)
+
+    model = build_model_from_checkpoint(checkpoint, device)
+
+    print(f"Loaded checkpoint: {checkpoint_file}")
+    print(f"  Epoch: {checkpoint.get('epoch', 'unknown')}")
+    quick = checkpoint.get("quick_validation_metrics")
+    if quick:
+        print(f"  Checkpoint's single-step validation MRAE: {quick.get('mrae', float('nan')):.6f}")
+
+    return model, checkpoint
+
+
+def save_hsi_cube(cube_chw: np.ndarray, output_path: Path, save_format: str) -> None:
+    """Save an [C,H,W] HSI cube to disk as either .mat (key 'cube') or .npy."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if save_format == "mat":
+        sio.savemat(str(output_path), {HSI_KEY: cube_chw})
+    elif save_format == "npy":
+        np.save(str(output_path), cube_chw)
+    else:
+        raise ValueError(f"Unknown save format: {save_format}")
+
+
+def discover_inference_inputs(input_path: str) -> List[Path]:
+    """Accept either a single RGB image file or a directory of RGB images."""
+    path = Path(input_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Inference input not found: {path}")
+
+    if path.is_file():
+        if path.suffix.lower() not in SUPPORTED_RGB_EXTENSIONS:
+            raise ValueError(
+                f"{path} does not have a supported RGB extension "
+                f"({sorted(SUPPORTED_RGB_EXTENSIONS)})"
+            )
+        return [path]
+
+    return find_files_with_extensions(input_path, SUPPORTED_RGB_EXTENSIONS)
+
+
+@torch.no_grad()
+def run_inference(
+    model: ResidualDiffusionRGB2HSI,
+    input_path: str,
+    output_dir: str,
+    device: torch.device,
+    use_amp: bool,
+    save_format: str = INFER_SAVE_FORMAT,
+    save_coarse: bool = INFER_SAVE_COARSE,
+    gt_hsi_dir: Optional[str] = INFER_GT_HSI_DIR,
+    num_sampling_steps: int = NUM_SAMPLING_STEPS,
+    use_ddim_sampling: bool = USE_DDIM_SAMPLING,
+) -> Dict[str, float]:
+    """Run full reverse-diffusion inference on one RGB image or a directory.
+
+    For every RGB input this predicts the fine HSI cube with
+    `diffusion_full_sample()` (the same multi-step DDIM/DDPM reverse
+    sampling used once at the end of training) and saves it next to the
+    coarse MST++ prediction if `save_coarse` is set.
+
+    If `gt_hsi_dir` is given, ground-truth cubes with a matching file stem
+    are loaded (via the same `load_hsi_file` / `align_hsi_orientation`
+    helpers used for training) purely to report mrae/rmse/sam/psnr/ssim;
+    they are never required for making a prediction.
+
+    Returns the averaged metrics across all inputs with an available ground
+    truth (empty dict if none was found).
+    """
+    model.eval()
+
+    rgb_paths = discover_inference_inputs(input_path)
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    metric_totals = _empty_metric_totals()
+    metric_count = 0
+
+    print(f"\nRunning inference on {len(rgb_paths)} RGB image(s)")
+    print(f"Sampling steps: {num_sampling_steps} | DDIM: {use_ddim_sampling}")
+    print(f"Saving predictions to: {output_root}")
+
+    for index, rgb_path in enumerate(rgb_paths, start=1):
+        rgb_array = load_rgb_file(rgb_path)
+        if not np.isfinite(rgb_array).all():
+            print(f"  Skipping {rgb_path.name}: NaN or Inf values in RGB input")
+            continue
+
+        rgb_tensor = torch.from_numpy(np.ascontiguousarray(rgb_array)).float()
+        rgb_tensor = rgb_tensor.unsqueeze(0).to(device, non_blocking=True)
+
+        with autocast(enabled=use_amp):
+            padded_rgb, (height, width) = pad_to_multiple(rgb_tensor, MODEL_DOWNSAMPLE_FACTOR)
+            fine_hsi_padded = model.sample(
+                padded_rgb,
+                num_sampling_steps=num_sampling_steps,
+                use_ddim=use_ddim_sampling,
+            )
+            y0_padded = model.get_coarse_prediction(padded_rgb)
+
+        fine_hsi = fine_hsi_padded[..., :height, :width].float()
+        y0 = y0_padded[..., :height, :width].float()
+
+        fine_hsi_np = fine_hsi.squeeze(0).cpu().numpy()
+        save_hsi_cube(
+            fine_hsi_np,
+            output_root / f"{rgb_path.stem}_pred.{save_format}",
+            save_format,
+        )
+        if save_coarse:
+            save_hsi_cube(
+                y0.squeeze(0).cpu().numpy(),
+                output_root / f"{rgb_path.stem}_coarse.{save_format}",
+                save_format,
+            )
+
+        status = f"  [{index:04d}/{len(rgb_paths):04d}] {rgb_path.name} -> saved"
+
+        if gt_hsi_dir is not None:
+            gt_candidates = [
+                candidate
+                for candidate in find_files_with_extensions(gt_hsi_dir, SUPPORTED_HSI_EXTENSIONS)
+                if candidate.stem == rgb_path.stem
+            ]
+            if gt_candidates:
+                gt_cube = load_hsi_file(gt_candidates[0], HSI_KEY)
+                gt_cube = convert_to_chw(gt_cube, HSI_CHANNELS, gt_candidates[0])
+                gt_cube = align_hsi_orientation(
+                    gt_cube, (rgb_array.shape[1], rgb_array.shape[2]), gt_candidates[0]
+                )
+                gt_tensor = (
+                    torch.from_numpy(np.ascontiguousarray(gt_cube))
+                    .float()
+                    .unsqueeze(0)
+                    .to(device)
+                )
+                metrics = calculate_metrics(fine_hsi, gt_tensor)
+                for name, value in metrics.items():
+                    metric_totals[name] += value
+                metric_count += 1
+                status += (
+                    f" | MRAE: {metrics['mrae']:.4f} | PSNR: {metrics['psnr']:.2f} "
+                    f"| SAM: {metrics['sam']:.4f}"
+                )
+
+        print(status)
+
+    averaged_metrics = (
+        {name: value / metric_count for name, value in metric_totals.items()}
+        if metric_count > 0
+        else {}
+    )
+
+    if averaged_metrics:
+        print(
+            f"\nAverage metrics over {metric_count} image(s) with ground truth:\n"
+            f"  MRAE: {averaged_metrics['mrae']:.6f} | "
+            f"RMSE: {averaged_metrics['rmse']:.6f} | "
+            f"SAM: {averaged_metrics['sam']:.6f} | "
+            f"PSNR: {averaged_metrics['psnr']:.4f} | "
+            f"SSIM: {averaged_metrics['ssim']:.4f}"
+        )
+    elif gt_hsi_dir is not None:
+        print("\nNo matching ground-truth HSI cubes were found; no metrics computed.")
+
+    return averaged_metrics
+
+
+def run_inference_cli(args: argparse.Namespace) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = USE_AMP and device.type == "cuda"
+
+    model, _checkpoint = load_model_for_inference(args.checkpoint, device)
+
+    run_inference(
+        model=model,
+        input_path=args.input,
+        output_dir=args.output,
+        device=device,
+        use_amp=use_amp,
+        save_format=args.save_format,
+        save_coarse=args.save_coarse,
+        gt_hsi_dir=args.gt_hsi_dir,
+        num_sampling_steps=args.sampling_steps,
+        use_ddim_sampling=not args.no_ddim,
+    )
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -1573,5 +1833,90 @@ def main() -> None:
             )
 
 
+# =============================================================================
+# CLI entry point
+# =============================================================================
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train the residual diffusion RGB->HSI model, or run inference "
+            "with a saved checkpoint."
+        )
+    )
+    subparsers = parser.add_subparsers(dest="mode")
+
+    subparsers.add_parser(
+        "train",
+        help="Train the model using the configuration constants at the top of this file.",
+    )
+
+    infer_parser = subparsers.add_parser(
+        "infer",
+        help="Run full reverse-diffusion inference on one RGB image or a directory of RGB images.",
+    )
+    infer_parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=INFER_CHECKPOINT_PATH,
+        help=f"Path to a .pth checkpoint saved by this script (default: {INFER_CHECKPOINT_PATH})",
+    )
+    infer_parser.add_argument(
+        "--input",
+        type=str,
+        default=INFER_INPUT_DIR,
+        help="Path to a single RGB image file or a directory of RGB images.",
+    )
+    infer_parser.add_argument(
+        "--output",
+        type=str,
+        default=INFER_OUTPUT_DIR,
+        help=f"Directory to save predicted HSI cubes to (default: {INFER_OUTPUT_DIR})",
+    )
+    infer_parser.add_argument(
+        "--save-format",
+        type=str,
+        choices=["mat", "npy"],
+        default=INFER_SAVE_FORMAT,
+        help="File format for saved HSI cubes.",
+    )
+    infer_parser.add_argument(
+        "--save-coarse",
+        action="store_true",
+        default=INFER_SAVE_COARSE,
+        help="Also save the frozen MST++ coarse prediction (y0) for each input.",
+    )
+    infer_parser.add_argument(
+        "--gt-hsi-dir",
+        type=str,
+        default=INFER_GT_HSI_DIR,
+        help=(
+            "Optional directory of ground-truth HSI cubes (matched to RGB "
+            "inputs by file stem) used only to report mrae/rmse/sam/psnr/ssim."
+        ),
+    )
+    infer_parser.add_argument(
+        "--sampling-steps",
+        type=int,
+        default=NUM_SAMPLING_STEPS,
+        help=f"Number of reverse-diffusion sampling steps (default: {NUM_SAMPLING_STEPS})",
+    )
+    infer_parser.add_argument(
+        "--no-ddim",
+        action="store_true",
+        help="Use full DDPM ancestral sampling instead of DDIM.",
+    )
+
+    return parser
+
+
 if __name__ == "__main__":
-    main()
+    cli_args = build_arg_parser().parse_args()
+
+    if cli_args.mode == "infer":
+        run_inference_cli(cli_args)
+    else:
+        # Default to training when no subcommand (or "train") is given, so
+        # `python this_script.py` keeps working exactly as before.
+        main()
