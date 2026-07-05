@@ -72,7 +72,7 @@ import torch.nn.functional as F
 # actually tries to auto-construct MST++ without providing their own
 # instance.
 try:
-    from MST_Plus_Plus import MST_Plus_Plus
+    from .MST_Plus_Plus import MST_Plus_Plus
 except ImportError:
     MST_Plus_Plus = None
 
