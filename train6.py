@@ -1559,6 +1559,149 @@ def run_inference_cli(args: argparse.Namespace) -> None:
 
 
 # =============================================================================
+# Dataset visualisation (sanity-check a handful of random RGB/HSI pairs)
+# =============================================================================
+
+# Defaults used by `python this_script.py visualize ...` when the
+# corresponding CLI flag is not supplied.
+VISUALIZE_NUM_IMAGES = 5
+VISUALIZE_OUTPUT_PATH = str(Path(OUTPUT_DIR) / "dataset_preview.png")
+
+# Which HSI bands to average together to build a human-viewable "false
+# colour" composite (NTIRE/ARAD_1K cubes run roughly 400-700nm across 31
+# bands, so the low/middle/high thirds approximate blue/green/red).
+_HSI_FALSE_COLOR_BAND_FRACTIONS = ((0.75, 0.95), (0.45, 0.65), (0.05, 0.25))
+
+
+def hsi_cube_to_false_color(cube_chw: np.ndarray) -> np.ndarray:
+    """Turn a [C,H,W] HSI cube into a viewable [H,W,3] false-colour image.
+
+    Each output channel is the mean of a band range spread across the
+    spectrum (see `_HSI_FALSE_COLOR_BAND_FRACTIONS`), then the whole image
+    is min-max stretched to [0, 1] purely for display -- this does not
+    affect anything used in training.
+    """
+    num_bands = cube_chw.shape[0]
+    channels = []
+
+    for low_fraction, high_fraction in _HSI_FALSE_COLOR_BAND_FRACTIONS:
+        low_index = int(round(low_fraction * (num_bands - 1)))
+        high_index = int(round(high_fraction * (num_bands - 1)))
+        low_index, high_index = sorted((low_index, high_index))
+        channels.append(cube_chw[low_index : high_index + 1].mean(axis=0))
+
+    composite = np.stack(channels, axis=-1)
+    minimum = composite.min()
+    maximum = composite.max()
+    composite = (composite - minimum) / (maximum - minimum + 1e-8)
+    return composite
+
+
+def select_random_pairs(
+    pairs: Sequence[Tuple[Path, Path]],
+    num_images: int,
+    seed: Optional[int] = None,
+) -> List[Tuple[Path, Path]]:
+    """Pick `num_images` distinct random HSI/RGB pairs to preview."""
+    if not pairs:
+        raise RuntimeError("No HSI/RGB pairs available to visualise.")
+
+    sample_size = min(num_images, len(pairs))
+    rng = random.Random(seed) if seed is not None else random
+    return rng.sample(list(pairs), sample_size)
+
+
+def visualize_random_pairs(
+    pairs: Sequence[Tuple[Path, Path]],
+    num_images: int,
+    output_path: str,
+    seed: Optional[int] = None,
+) -> Path:
+    """Save a figure previewing `num_images` random RGB/HSI pairs.
+
+    For every sampled pair this shows, side by side:
+      - the RGB photo, as a human would normally see it, and
+      - a false-colour composite of the paired HSI cube (built by
+        averaging low/mid/high spectral bands into blue/green/red so the
+        31-band cube becomes viewable), with the number of bands and the
+        image resolution captioned underneath.
+
+    This is a read-only sanity check -- it does not touch training,
+    validation, checkpoints, or any of the loss/metric computations above.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    chosen_pairs = select_random_pairs(pairs, num_images, seed=seed)
+
+    figure, axes = plt.subplots(
+        len(chosen_pairs), 2, figsize=(8, 4 * len(chosen_pairs)), squeeze=False
+    )
+
+    for row, (hsi_path, rgb_path) in enumerate(chosen_pairs):
+        rgb_array = load_rgb_file(rgb_path)  # [3,H,W] in [0,1]
+        rgb_image = np.transpose(rgb_array, (1, 2, 0))
+
+        cube = load_hsi_file(hsi_path, HSI_KEY)
+        cube = convert_to_chw(cube, HSI_CHANNELS, hsi_path)
+        cube = align_hsi_orientation(
+            cube, (rgb_array.shape[1], rgb_array.shape[2]), hsi_path
+        )
+        false_color_image = hsi_cube_to_false_color(cube)
+
+        left_axis, right_axis = axes[row]
+
+        left_axis.imshow(np.clip(rgb_image, 0.0, 1.0))
+        left_axis.set_title(f"RGB: {rgb_path.name}", fontsize=10)
+        left_axis.axis("off")
+
+        right_axis.imshow(np.clip(false_color_image, 0.0, 1.0))
+        right_axis.set_title(
+            f"HSI (false colour): {hsi_path.name}\n"
+            f"{cube.shape[0]} bands, {cube.shape[1]}x{cube.shape[2]} px",
+            fontsize=10,
+        )
+        right_axis.axis("off")
+
+    figure.suptitle(
+        f"Random preview of {len(chosen_pairs)} RGB/HSI pair(s) from the dataset",
+        fontsize=12,
+    )
+    figure.tight_layout()
+
+    output_file = Path(output_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_file, dpi=150, bbox_inches="tight")
+    plt.close(figure)
+
+    print(f"\nSaved a preview of {len(chosen_pairs)} random RGB/HSI pair(s) to: {output_file}")
+    for hsi_path, rgb_path in chosen_pairs:
+        print(f"  RGB: {rgb_path}\n  HSI: {hsi_path}")
+
+    return output_file
+
+
+def run_visualization_cli(args: argparse.Namespace) -> None:
+    """Entry point for `python this_script.py visualize ...`.
+
+    Discovers RGB/HSI pairs from HSI_DATA_DIR/RGB_DATA_DIR (the same
+    directories and pairing logic used for training), picks a random subset,
+    and saves a side-by-side preview image. This never loads the model and
+    never touches training/validation/checkpointing code.
+    """
+    pairs = find_paired_files(HSI_DATA_DIR, RGB_DATA_DIR)
+    print(f"Found {len(pairs)} total HSI/RGB pairs in the dataset directories.")
+
+    visualize_random_pairs(
+        pairs=pairs,
+        num_images=args.num_images,
+        output_path=args.output,
+        seed=args.seed,
+    )
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -1908,6 +2051,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Use full DDPM ancestral sampling instead of DDIM.",
     )
 
+    visualize_parser = subparsers.add_parser(
+        "visualize",
+        help=(
+            "Preview a handful of random RGB/HSI pairs from the dataset "
+            "directories as a side-by-side image (RGB photo vs. false-colour "
+            "HSI). Does not load the model or touch training/checkpoints."
+        ),
+    )
+    visualize_parser.add_argument(
+        "--num-images",
+        type=int,
+        default=VISUALIZE_NUM_IMAGES,
+        help=f"How many random pairs to preview (default: {VISUALIZE_NUM_IMAGES})",
+    )
+    visualize_parser.add_argument(
+        "--output",
+        type=str,
+        default=VISUALIZE_OUTPUT_PATH,
+        help=f"Where to save the preview image (default: {VISUALIZE_OUTPUT_PATH})",
+    )
+    visualize_parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional random seed, for a reproducible choice of preview images.",
+    )
+
     return parser
 
 
@@ -1916,6 +2086,8 @@ if __name__ == "__main__":
 
     if cli_args.mode == "infer":
         run_inference_cli(cli_args)
+    elif cli_args.mode == "visualize":
+        run_visualization_cli(cli_args)
     else:
         # Default to training when no subcommand (or "train") is given, so
         # `python this_script.py` keeps working exactly as before.
