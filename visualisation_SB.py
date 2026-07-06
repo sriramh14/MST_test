@@ -1,30 +1,27 @@
-"""Parser-free evaluation and visualisation for an I2SB RGB -> HSI model.
+"""Parser-free visualisation for selected I2SB RGB -> HSI samples.
 
 What this script does
 ---------------------
-1. Recreates the same deterministic validation split used by the training code.
-2. Loads complete native-resolution paired RGB/HSI images.
-3. Corrects HSI H/W orientation when the spectral cube is stored transposed.
-4. Pads only immediately before MST++ / I2SB inference and crops predictions
-   back to the original image size.
-5. Evaluates the frozen MST++ coarse output and the full multi-step I2SB output
-   over the complete evaluation dataset.
-6. Saves per-image metrics to CSV and aggregate mean/std/median metrics to JSON.
-7. Randomly selects exactly three evaluation examples and creates a figure with:
+1. Recreates the same deterministic validation split used during training.
+2. Selects only the requested validation images by file stem or dataset index.
+   When neither is supplied, it randomly selects a small number of images.
+3. Loads only those selected native-resolution RGB/HSI pairs.
+4. Corrects a transposed HSI orientation when necessary.
+5. Runs the frozen MST++ coarse prediction and the complete multi-step I2SB
+   reverse process only for the selected images.
+6. Saves a visualisation containing, for each selected image:
       RGB input | GT pseudo-RGB | MST++ pseudo-RGB | I2SB pseudo-RGB |
       I2SB spectral-MAE map | spectrum at the highest-error pixel
-8. Optionally saves the three visualised HSI cubes as compressed NPZ files.
+7. Optionally saves the selected ground-truth, coarse, and refined HSI cubes.
 
-There is intentionally no argparse parser. Edit the Configuration section below.
+No whole-dataset evaluation, aggregate metric report, CSV, or JSON is produced.
+There is intentionally no argparse parser. Edit the Configuration section.
 """
 
 from __future__ import annotations
 
-import csv
-import json
 import math
 import random
-import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
@@ -36,11 +33,9 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torch.cuda.amp import autocast
-from torch.utils.data import DataLoader, Dataset
 
 # Adjust these imports to match the repository layout used for training.
 from model.I2I_SB import I2SBModel
-from loss.mrae import mrae
 from loss.psnr import psnr
 from loss.rmse import rmse
 from loss.sam import sam
@@ -63,7 +58,7 @@ RGB_DATA_DIR = (
 # Prefer the final checkpoint when it exists because it contains the model from
 # the final epoch. Change this to best_i2sb.pth to inspect the best quick-MRAE
 # checkpoint instead.
-CHECKPOINT_PATH = "./i2sb_checkpoints/best_i2sb.pth"
+CHECKPOINT_PATH = "./i2sb_checkpoints/final_i2sb_with_full_sampling.pth"
 
 # Only needed when CHECKPOINT_PATH does not contain the frozen MST++ weights.
 # Checkpoints produced by the supplied training script save model.state_dict(),
@@ -78,13 +73,42 @@ RGB_CHANNELS = 3
 SUPPORTED_HSI_EXTENSIONS = {".mat", ".npy", ".npz", ".pt", ".pth"}
 SUPPORTED_RGB_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".npy"}
 
-# Must match training when recreating its validation split.
+# Must match training when recreating its validation split. Set this to False
+# only when the intended visualisation pool is the complete paired dataset.
 USE_VALIDATION_SPLIT = True
 VALIDATION_FRACTION = 0.10
 SEED = 42
 
+# -----------------------------------------------------------------------------
+# Image selection
+# -----------------------------------------------------------------------------
+# Selection priority:
+#   1. SELECTED_IMAGE_STEMS, when non-empty.
+#   2. SELECTED_DATASET_INDICES, when non-empty.
+#   3. RANDOM_SELECTION_COUNT random images from the chosen pool.
+#
+# A stem is the filename without its extension. For example,
+# "ARAD_1K_0001" selects ARAD_1K_0001.mat and ARAD_1K_0001.jpg/png.
+SELECTED_IMAGE_STEMS: list[str] = [
+    # "ARAD_1K_0001",
+    # "ARAD_1K_0017",
+    # "ARAD_1K_0052",
+]
+
+# Indices refer to the deterministic validation pool after split_pairs() when
+# USE_VALIDATION_SPLIT=True, otherwise to the sorted complete paired dataset.
+SELECTED_DATASET_INDICES: list[int] = []
+
+# Used only when both lists above are empty.
+RANDOM_SELECTION_COUNT = 3
+
 # Must match training-time preprocessing.
 NORMALIZATION = "none"  # "none", "minmax", or "band_minmax"
+
+# MRAE = mean(|prediction - target| / max(|target|, epsilon)).
+# The denominator is always the ground-truth HSI. Keeping this definition
+# local avoids ambiguity about the argument order used by loss.mrae.mrae.
+MRAE_EPSILON = 1.0e-8
 
 # Fallback architecture values. When available, model_config stored inside the
 # checkpoint overrides these values automatically.
@@ -109,12 +133,7 @@ USE_TILED_REVERSE = False
 REVERSE_TILE_SIZE = 256
 REVERSE_TILE_OVERLAP = 32
 
-# Validation uses batch size one because image sizes may differ.
-BATCH_SIZE = 1
-NUM_WORKERS = 2
-
-# Exactly three randomly selected evaluation examples are visualised.
-NUM_VISUALISATIONS = 3
+# Save the selected full HSI cubes in addition to the PNG figure.
 SAVE_VISUALISED_CUBES = True
 
 # Approximate ARAD/NTIRE wavelengths. Change these when using another sensor.
@@ -137,13 +156,6 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
-def seed_worker(worker_id: int) -> None:
-    del worker_id
-    worker_seed = torch.initial_seed() % (2**32)
-    random.seed(worker_seed)
-    np.random.seed(worker_seed)
 
 
 # =============================================================================
@@ -396,52 +408,6 @@ def load_rgb_file(file_path: Path) -> np.ndarray:
     )
 
 
-class RGBHSIEvaluationDataset(Dataset):
-    """Complete native-resolution HSI/RGB pairs with sample metadata."""
-
-    def __init__(
-        self,
-        pairs: List[Tuple[Path, Path]],
-        hsi_channels: int,
-        normalization: str,
-    ) -> None:
-        self.pairs = pairs
-        self.hsi_channels = hsi_channels
-        self.normalization = normalization
-
-    def __len__(self) -> int:
-        return len(self.pairs)
-
-    def __getitem__(self, index: int) -> Dict[str, Any]:
-        hsi_path, rgb_path = self.pairs[index]
-
-        hsi = load_hsi_file(hsi_path, HSI_KEY)
-        hsi = convert_to_chw(hsi, self.hsi_channels, hsi_path)
-        rgb = load_rgb_file(rgb_path)
-
-        if not np.isfinite(hsi).all():
-            raise ValueError(f"NaN/Inf found in {hsi_path}")
-        if not np.isfinite(rgb).all():
-            raise ValueError(f"NaN/Inf found in {rgb_path}")
-
-        hsi = align_hsi_orientation(
-            hsi,
-            target_hw=(rgb.shape[1], rgb.shape[2]),
-            file_path=hsi_path,
-        )
-        hsi = normalize_cube(hsi, self.normalization)
-
-        rgb_tensor = torch.from_numpy(np.ascontiguousarray(rgb)).float()
-        hsi_tensor = torch.from_numpy(np.ascontiguousarray(hsi)).float()
-
-        return {
-            "rgb": rgb_tensor,
-            "hsi": hsi_tensor,
-            "stem": hsi_path.stem,
-            "hsi_path": str(hsi_path),
-            "rgb_path": str(rgb_path),
-            "index": index,
-        }
 
 
 # =============================================================================
@@ -763,7 +729,33 @@ def run_full_inference(
 # =============================================================================
 
 
-METRIC_NAMES = ("mrae", "rmse", "sam", "psnr", "ssim")
+@torch.inference_mode()
+def compute_mrae(
+    reconstruction: torch.Tensor,
+    target: torch.Tensor,
+    epsilon: float = MRAE_EPSILON,
+) -> torch.Tensor:
+    """Return MRAE with the ground truth in the denominator.
+
+    MRAE = mean(abs(reconstruction - target) / max(abs(target), epsilon))
+
+    The mean is taken over every batch, spectral, and spatial element.
+    Metrics are evaluated in float32 even when model inference uses AMP.
+    """
+    reconstruction = reconstruction.float()
+    target = target.float()
+
+    if reconstruction.shape != target.shape:
+        raise ValueError(
+            f"MRAE shape mismatch: reconstruction={tuple(reconstruction.shape)}, "
+            f"target={tuple(target.shape)}"
+        )
+    if epsilon <= 0:
+        raise ValueError("MRAE epsilon must be positive.")
+
+    denominator = target.abs().clamp_min(epsilon)
+    relative_absolute_error = (reconstruction - target).abs() / denominator
+    return relative_absolute_error.mean()
 
 
 @torch.inference_mode()
@@ -775,7 +767,7 @@ def calculate_metrics(
     target = target.float()
 
     values = {
-        "mrae": float(mrae(target, reconstruction).item()),
+        "mrae": float(compute_mrae(reconstruction, target).item()),
         "rmse": float(rmse(target, reconstruction).item()),
         "sam": float(sam(target, reconstruction).item()),
         "psnr": float(psnr(target, reconstruction).item()),
@@ -787,52 +779,6 @@ def calculate_metrics(
     return values
 
 
-def summarize_metric_rows(
-    rows: Sequence[Mapping[str, Any]],
-    prefix: str,
-) -> Dict[str, Dict[str, float]]:
-    summary: Dict[str, Dict[str, float]] = {}
-    for metric_name in METRIC_NAMES:
-        values = np.asarray(
-            [float(row[f"{prefix}_{metric_name}"]) for row in rows],
-            dtype=np.float64,
-        )
-        summary[metric_name] = {
-            "mean": float(values.mean()),
-            "std": float(values.std(ddof=0)),
-            "median": float(np.median(values)),
-            "min": float(values.min()),
-            "max": float(values.max()),
-        }
-    return summary
-
-
-def print_metric_summary(
-    coarse_summary: Mapping[str, Mapping[str, float]],
-    refined_summary: Mapping[str, Mapping[str, float]],
-) -> None:
-    header = (
-        f"{'Metric':<8} | {'MST++ mean':>12} | {'I2SB mean':>12} | "
-        f"{'I2SB std':>10} | {'Change':>12}"
-    )
-    print("\n" + header)
-    print("-" * len(header))
-
-    for name in METRIC_NAMES:
-        coarse = coarse_summary[name]["mean"]
-        refined = refined_summary[name]["mean"]
-        refined_std = refined_summary[name]["std"]
-
-        if name in {"mrae", "rmse", "sam"}:
-            change = 100.0 * (coarse - refined) / max(abs(coarse), 1e-12)
-            change_text = f"{change:+.2f}%"
-        else:
-            change_text = f"{refined - coarse:+.4f}"
-
-        print(
-            f"{name.upper():<8} | {coarse:12.6f} | {refined:12.6f} | "
-            f"{refined_std:10.6f} | {change_text:>12}"
-        )
 
 
 # =============================================================================
@@ -875,10 +821,8 @@ def create_visualisation_figure(
     samples: Sequence[Mapping[str, Any]],
     output_path: Path,
 ) -> None:
-    if len(samples) != NUM_VISUALISATIONS:
-        raise ValueError(
-            f"Expected {NUM_VISUALISATIONS} visualisation samples, got {len(samples)}"
-        )
+    if not samples:
+        raise ValueError("No visualisation samples were provided.")
 
     wavelengths = np.linspace(
         WAVELENGTH_START_NM,
@@ -980,7 +924,7 @@ def create_visualisation_figure(
             axes[row_index, col_index].axis("off")
 
     figure.suptitle(
-        "RGB-to-HSI evaluation: frozen MST++ boundary vs full I2SB reverse sample",
+        "Selected RGB-to-HSI samples: MST++ boundary vs full I2SB reverse sample",
         fontsize=16,
     )
     figure.savefig(output_path, dpi=180, bbox_inches="tight")
@@ -988,20 +932,78 @@ def create_visualisation_figure(
 
 
 # =============================================================================
-# Evaluation orchestration
+# Selected-sample orchestration
 # =============================================================================
 
 
-def save_per_image_csv(rows: Sequence[Mapping[str, Any]], output_path: Path) -> None:
-    fieldnames = ["index", "stem", "height", "width", "seconds"]
-    for prefix in ("coarse", "refined"):
-        fieldnames.extend(f"{prefix}_{name}" for name in METRIC_NAMES)
+def choose_visualisation_pairs(
+    pairs: Sequence[Tuple[Path, Path]],
+) -> List[Tuple[int, Path, Path]]:
+    """Return only the explicitly selected pairs, preserving requested order."""
+    if not pairs:
+        raise RuntimeError("The visualisation pool is empty.")
 
-    with output_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({key: row[key] for key in fieldnames})
+    if SELECTED_IMAGE_STEMS:
+        duplicate_requested = {
+            stem for stem in SELECTED_IMAGE_STEMS
+            if SELECTED_IMAGE_STEMS.count(stem) > 1
+        }
+        if duplicate_requested:
+            raise ValueError(
+                "SELECTED_IMAGE_STEMS contains duplicates: "
+                f"{sorted(duplicate_requested)}"
+            )
+
+        by_stem = {hsi_path.stem: (index, hsi_path, rgb_path)
+                   for index, (hsi_path, rgb_path) in enumerate(pairs)}
+        missing = [stem for stem in SELECTED_IMAGE_STEMS if stem not in by_stem]
+        if missing:
+            available_examples = sorted(by_stem)[:10]
+            raise KeyError(
+                "The following selected stems were not found in the chosen "
+                f"dataset pool: {missing}. Available examples: {available_examples}"
+            )
+        return [by_stem[stem] for stem in SELECTED_IMAGE_STEMS]
+
+    if SELECTED_DATASET_INDICES:
+        duplicate_indices = {
+            index for index in SELECTED_DATASET_INDICES
+            if SELECTED_DATASET_INDICES.count(index) > 1
+        }
+        if duplicate_indices:
+            raise ValueError(
+                "SELECTED_DATASET_INDICES contains duplicates: "
+                f"{sorted(duplicate_indices)}"
+            )
+
+        invalid = [
+            index for index in SELECTED_DATASET_INDICES
+            if index < 0 or index >= len(pairs)
+        ]
+        if invalid:
+            raise IndexError(
+                f"Selected indices {invalid} are outside [0, {len(pairs) - 1}]."
+            )
+        return [
+            (index, pairs[index][0], pairs[index][1])
+            for index in SELECTED_DATASET_INDICES
+        ]
+
+    if RANDOM_SELECTION_COUNT <= 0:
+        raise ValueError("RANDOM_SELECTION_COUNT must be positive.")
+    if RANDOM_SELECTION_COUNT > len(pairs):
+        raise ValueError(
+            f"RANDOM_SELECTION_COUNT={RANDOM_SELECTION_COUNT}, but the pool "
+            f"contains only {len(pairs)} images."
+        )
+
+    selected_indices = random.Random(SEED).sample(
+        range(len(pairs)), k=RANDOM_SELECTION_COUNT
+    )
+    return [
+        (index, pairs[index][0], pairs[index][1])
+        for index in selected_indices
+    ]
 
 
 def save_visualised_sample_cubes(
@@ -1018,100 +1020,108 @@ def save_visualised_sample_cubes(
     )
 
 
-def evaluate_dataset(
+@torch.inference_mode()
+def visualise_selected_samples(
     model: I2SBModel,
-    loader: DataLoader,
+    selected_pairs: Sequence[Tuple[int, Path, Path]],
     device: torch.device,
     model_downsample_factor: int,
-    visualisation_indices: set[int],
     use_amp: bool,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    metric_rows: List[Dict[str, Any]] = []
-    visualisation_samples: List[Dict[str, Any]] = []
+) -> List[Dict[str, Any]]:
+    """Load and infer only the selected image pairs."""
+    samples: List[Dict[str, Any]] = []
 
-    total = len(loader.dataset)
-    for batch_number, batch in enumerate(loader, start=1):
-        if BATCH_SIZE != 1:
-            raise ValueError("This script expects BATCH_SIZE = 1.")
+    for position, (pool_index, hsi_path, rgb_path) in enumerate(
+        selected_pairs, start=1
+    ):
+        hsi = load_hsi_file(hsi_path, HSI_KEY)
+        hsi = convert_to_chw(hsi, HSI_CHANNELS, hsi_path)
+        rgb = load_rgb_file(rgb_path)
 
-        rgb = batch["rgb"].to(device, non_blocking=True)
-        target = batch["hsi"].to(device, non_blocking=True)
-        stem = batch["stem"][0]
-        index = int(batch["index"].item())
+        if not np.isfinite(hsi).all():
+            raise ValueError(f"NaN/Inf found in {hsi_path}")
+        if not np.isfinite(rgb).all():
+            raise ValueError(f"NaN/Inf found in {rgb_path}")
 
-        if rgb.shape[-2:] != target.shape[-2:]:
+        hsi = align_hsi_orientation(
+            hsi, target_hw=(rgb.shape[1], rgb.shape[2]), file_path=hsi_path
+        )
+        hsi = normalize_cube(hsi, NORMALIZATION)
+
+        rgb_tensor = (
+            torch.from_numpy(np.ascontiguousarray(rgb))
+            .float()
+            .unsqueeze(0)
+            .to(device)
+        )
+        target_tensor = (
+            torch.from_numpy(np.ascontiguousarray(hsi))
+            .float()
+            .unsqueeze(0)
+            .to(device)
+        )
+
+        if rgb_tensor.shape[-2:] != target_tensor.shape[-2:]:
             raise ValueError(
-                f"Spatial mismatch for {stem}: RGB {tuple(rgb.shape[-2:])}, "
-                f"HSI {tuple(target.shape[-2:])}"
+                f"Spatial mismatch for {hsi_path.stem}: RGB "
+                f"{tuple(rgb_tensor.shape[-2:])}, HSI "
+                f"{tuple(target_tensor.shape[-2:])}"
             )
 
-        # Make the stochastic reverse trajectory reproducible per image.
-        sample_seed = SEED + index
+        # Make each selected sample's stochastic reverse trajectory repeatable.
+        sample_seed = SEED + pool_index
         torch.manual_seed(sample_seed)
         torch.cuda.manual_seed_all(sample_seed)
 
-        start_time = time.perf_counter()
         refined, coarse = run_full_inference(
             model=model,
-            rgb=rgb,
+            rgb=rgb_tensor,
             model_downsample_factor=model_downsample_factor,
             num_steps=NUM_SAMPLING_STEPS,
             use_amp=use_amp,
         )
-        elapsed = time.perf_counter() - start_time
 
-        if refined.shape != target.shape or coarse.shape != target.shape:
+        if refined.shape != target_tensor.shape or coarse.shape != target_tensor.shape:
             raise RuntimeError(
-                f"Prediction shape mismatch for {stem}: target={tuple(target.shape)}, "
+                f"Prediction shape mismatch for {hsi_path.stem}: "
+                f"target={tuple(target_tensor.shape)}, "
                 f"coarse={tuple(coarse.shape)}, refined={tuple(refined.shape)}"
             )
         if not torch.isfinite(refined).all():
-            raise FloatingPointError(f"Non-finite I2SB output for {stem}")
+            raise FloatingPointError(f"Non-finite I2SB output for {hsi_path.stem}")
         if not torch.isfinite(coarse).all():
-            raise FloatingPointError(f"Non-finite MST++ output for {stem}")
+            raise FloatingPointError(f"Non-finite MST++ output for {hsi_path.stem}")
 
-        coarse_metrics = calculate_metrics(coarse, target)
-        refined_metrics = calculate_metrics(refined, target)
+        # These metrics are calculated only for the displayed image and are
+        # used in its figure titles. No dataset aggregation is performed.
+        coarse_metrics = calculate_metrics(coarse, target_tensor)
+        refined_metrics = calculate_metrics(refined, target_tensor)
 
-        row: Dict[str, Any] = {
-            "index": index,
-            "stem": stem,
-            "height": int(target.shape[-2]),
-            "width": int(target.shape[-1]),
-            "seconds": float(elapsed),
+        sample: Dict[str, Any] = {
+            "index": pool_index,
+            "stem": hsi_path.stem,
+            "rgb": rgb_tensor[0].cpu().float().numpy(),
+            "target": target_tensor[0].cpu().float().numpy(),
+            "coarse": coarse[0].cpu().float().numpy(),
+            "refined": refined[0].cpu().float().numpy(),
+            "coarse_metrics": coarse_metrics,
+            "refined_metrics": refined_metrics,
         }
-        row.update({f"coarse_{key}": value for key, value in coarse_metrics.items()})
-        row.update({f"refined_{key}": value for key, value in refined_metrics.items()})
-        metric_rows.append(row)
+        samples.append(sample)
+
+        if SAVE_VISUALISED_CUBES:
+            save_visualised_sample_cubes(
+                sample, OUTPUT_DIR / "visualised_cubes"
+            )
 
         print(
-            f"[{batch_number:04d}/{total:04d}] {stem} | "
-            f"MST MRAE {coarse_metrics['mrae']:.6f} | "
+            f"[{position:02d}/{len(selected_pairs):02d}] {hsi_path.stem} | "
+            f"MST++ MRAE {coarse_metrics['mrae']:.6f} | "
             f"I2SB MRAE {refined_metrics['mrae']:.6f} | "
-            f"I2SB PSNR {refined_metrics['psnr']:.3f} | "
-            f"{elapsed:.2f}s"
+            f"I2SB PSNR {refined_metrics['psnr']:.3f}"
         )
 
-        if index in visualisation_indices:
-            sample = {
-                "index": index,
-                "stem": stem,
-                "rgb": rgb[0].detach().cpu().float().numpy(),
-                "target": target[0].detach().cpu().float().numpy(),
-                "coarse": coarse[0].detach().cpu().float().numpy(),
-                "refined": refined[0].detach().cpu().float().numpy(),
-                "coarse_metrics": coarse_metrics,
-                "refined_metrics": refined_metrics,
-            }
-            visualisation_samples.append(sample)
-            if SAVE_VISUALISED_CUBES:
-                save_visualised_sample_cubes(
-                    sample,
-                    OUTPUT_DIR / "visualised_cubes",
-                )
-
-    visualisation_samples.sort(key=lambda item: item["index"])
-    return metric_rows, visualisation_samples
+    return samples
 
 
 # =============================================================================
@@ -1132,107 +1142,58 @@ def main() -> None:
 
     all_pairs = find_paired_files(HSI_DATA_DIR, RGB_DATA_DIR)
     if USE_VALIDATION_SPLIT:
-        _training_pairs, evaluation_pairs = split_pairs(
-            all_pairs,
-            validation_fraction=VALIDATION_FRACTION,
-            seed=SEED,
+        _training_pairs, visualisation_pool = split_pairs(
+            all_pairs, validation_fraction=VALIDATION_FRACTION, seed=SEED
         )
-        split_name = "validation"
+        pool_name = "deterministic validation split"
     else:
-        evaluation_pairs = all_pairs
-        split_name = "all paired data"
+        visualisation_pool = all_pairs
+        pool_name = "complete paired dataset"
 
-    if len(evaluation_pairs) < NUM_VISUALISATIONS:
-        raise RuntimeError(
-            f"Evaluation set has only {len(evaluation_pairs)} samples, but "
-            f"NUM_VISUALISATIONS={NUM_VISUALISATIONS}."
-        )
-
-    dataset = RGBHSIEvaluationDataset(
-        pairs=evaluation_pairs,
-        hsi_channels=HSI_CHANNELS,
-        normalization=NORMALIZATION,
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=device.type == "cuda",
-        drop_last=False,
-        persistent_workers=NUM_WORKERS > 0,
-        worker_init_fn=seed_worker,
-    )
+    selected_pairs = choose_visualisation_pairs(visualisation_pool)
 
     model, checkpoint = build_model_from_checkpoint(CHECKPOINT_PATH, device)
-    channel_mults = tuple(
-        checkpoint.get("model_config", {}).get(
-            "channel_mults", UNET_CHANNEL_MULTIPLIERS
+    channel_mults = (
+        tuple(
+            checkpoint.get("model_config", {}).get(
+                "channel_mults", UNET_CHANNEL_MULTIPLIERS
+            )
         )
-    ) if isinstance(checkpoint, Mapping) else UNET_CHANNEL_MULTIPLIERS
+        if isinstance(checkpoint, Mapping)
+        else UNET_CHANNEL_MULTIPLIERS
+    )
     model_downsample_factor = 2 ** (len(channel_mults) - 1)
 
-    rng = random.Random(SEED)
-    selected_indices = set(
-        rng.sample(range(len(dataset)), k=NUM_VISUALISATIONS)
-    )
-
-    print("\nEvaluation configuration")
+    print("\nVisualisation configuration")
     print(f"  Device: {device}")
     print(f"  Mixed precision: {use_amp}")
-    print(f"  Dataset split: {split_name}")
-    print(f"  Evaluation images: {len(dataset)}")
+    print(f"  Selection pool: {pool_name} ({len(visualisation_pool)} images)")
+    print(f"  Selected images: {len(selected_pairs)}")
     print(f"  Sampling steps: {NUM_SAMPLING_STEPS}")
     print(f"  Tiled reverse sampling: {USE_TILED_REVERSE}")
     if USE_TILED_REVERSE:
         print(
-            f"  Reverse tile: {REVERSE_TILE_SIZE}, overlap: {REVERSE_TILE_OVERLAP}"
+            f"  Reverse tile: {REVERSE_TILE_SIZE}, "
+            f"overlap: {REVERSE_TILE_OVERLAP}"
         )
-    print(f"  Random visualisation indices: {sorted(selected_indices)}")
+    for pool_index, hsi_path, _rgb_path in selected_pairs:
+        print(f"    [{pool_index}] {hsi_path.stem}")
 
-    rows, visualisation_samples = evaluate_dataset(
+    samples = visualise_selected_samples(
         model=model,
-        loader=loader,
+        selected_pairs=selected_pairs,
         device=device,
         model_downsample_factor=model_downsample_factor,
-        visualisation_indices=selected_indices,
         use_amp=use_amp,
     )
 
-    coarse_summary = summarize_metric_rows(rows, "coarse")
-    refined_summary = summarize_metric_rows(rows, "refined")
-    print_metric_summary(coarse_summary, refined_summary)
-
-    csv_path = OUTPUT_DIR / "per_image_metrics.csv"
-    save_per_image_csv(rows, csv_path)
-
-    mean_seconds = float(np.mean([row["seconds"] for row in rows]))
-    summary = {
-        "checkpoint": str(checkpoint_path.resolve()),
-        "dataset_split": split_name,
-        "num_images": len(rows),
-        "num_sampling_steps": NUM_SAMPLING_STEPS,
-        "normalization": NORMALIZATION,
-        "tiled_reverse": USE_TILED_REVERSE,
-        "mean_seconds_per_image": mean_seconds,
-        "mst_coarse": coarse_summary,
-        "i2sb_refined": refined_summary,
-        "visualisation_indices": sorted(selected_indices),
-        "visualisation_stems": [sample["stem"] for sample in visualisation_samples],
-    }
-    json_path = OUTPUT_DIR / "summary_metrics.json"
-    with json_path.open("w", encoding="utf-8") as handle:
-        json.dump(summary, handle, indent=2)
-
-    figure_path = OUTPUT_DIR / "three_random_validation_examples.png"
-    create_visualisation_figure(visualisation_samples, figure_path)
+    figure_path = OUTPUT_DIR / "selected_i2sb_visualisations.png"
+    create_visualisation_figure(samples, figure_path)
 
     print("\nSaved outputs")
-    print(f"  Per-image metrics: {csv_path}")
-    print(f"  Summary metrics:   {json_path}")
-    print(f"  Visualisation:     {figure_path}")
+    print(f"  Visualisation: {figure_path}")
     if SAVE_VISUALISED_CUBES:
-        print(f"  Visualised cubes:  {OUTPUT_DIR / 'visualised_cubes'}")
+        print(f"  Selected cubes: {OUTPUT_DIR / 'visualised_cubes'}")
 
 
 if __name__ == "__main__":
