@@ -1,4 +1,4 @@
-from __future__ import annotations
+\from __future__ import annotations
 
 import math
 from pathlib import Path
@@ -280,53 +280,67 @@ class MSTBBDMDenoiser(nn.Module):
             self.pad_multiple - width % self.pad_multiple
         ) % self.pad_multiple
 
-        inputs = torch.cat(
-            [
-                x_t,
-                coarse_hsi,
-                rgb,
-            ],
-            dim=1,
-        )
+        # The imported MST architecture contains depthwise positional
+        # convolutions that can fail under FP16/BF16 autocast on some Kaggle
+        # GPU/cuDNN combinations. Run the trainable MST denoiser in FP32.
+        #
+        # Autocast is disabled only for this denoiser. Gradients are still
+        # calculated normally, so the MST denoiser remains fully trainable.
+        with torch.autocast(
+            device_type=x_t.device.type,
+            enabled=False,
+        ):
+            inputs = torch.cat(
+                [
+                    x_t.float(),
+                    coarse_hsi.float(),
+                    rgb.float(),
+                ],
+                dim=1,
+            ).contiguous()
 
-        if pad_height or pad_width:
-            padding_mode = (
-                "reflect"
-                if height > pad_height and width > pad_width
-                else "replicate"
+            if pad_height or pad_width:
+                padding_mode = (
+                    "reflect"
+                    if height > pad_height and width > pad_width
+                    else "replicate"
+                )
+
+                inputs = F.pad(
+                    inputs,
+                    (0, pad_width, 0, pad_height),
+                    mode=padding_mode,
+                )
+
+            features = self.conv_in(inputs)
+
+            normalized_timestep = (
+                t.float() / float(total_steps)
             )
 
-            inputs = F.pad(
-                inputs,
-                (0, pad_width, 0, pad_height),
-                mode=padding_mode,
+            time_features = self.time_mlp(
+                normalized_timestep
+            ).float()
+
+            features = (
+                features
+                + time_features[:, :, None, None]
             )
 
-        features = self.conv_in(inputs)
+            features = self.body(
+                features.contiguous()
+            )
 
-        normalized_timestep = (
-            t.float() / float(total_steps)
-        )
-
-        time_features = self.time_mlp(
-            normalized_timestep
-        ).to(features.dtype)
-
-        features = (
-            features
-            + time_features[:, :, None, None]
-        )
-
-        predicted_objective = self.conv_out(
-            self.body(features)
-        )
+            predicted_objective = self.conv_out(
+                features
+            )
 
         return predicted_objective[
             :,
             :,
             :height,
             :width,
-        ]
+        ].contiguous()
 
 
 # ============================================================================
