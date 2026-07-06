@@ -9,45 +9,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ============================================================================
-# Project import
-# ============================================================================
-# Adjust this path to match your project layout.
-#
-# Both classes are taken from the existing MST++ architecture file:
-#   - MST is used as the trainable BBDM denoiser backbone.
-#   - MST_Plus_Plus is used as the frozen coarse RGB-to-HSI model.
-from .MST_Plus_Plus import MST, MST_Plus_Plus
+# Adjust this import path to match your project structure.
+from model.MST_Plus_Plus import MST, MST_Plus_Plus
 
 
 # ============================================================================
-# Small helpers
+# Checkpoint helpers
 # ============================================================================
 
-def _load_checkpoint(
-    checkpoint_path: str | Path,
-) -> Any:
+def _load_checkpoint(path: str | Path) -> Any:
     try:
-        return torch.load(
-            checkpoint_path,
-            map_location="cpu",
-            weights_only=False,
-        )
+        return torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:
-        return torch.load(
-            checkpoint_path,
-            map_location="cpu",
-        )
+        return torch.load(path, map_location="cpu")
 
 
 def _strip_prefix(
     state_dict: dict[str, torch.Tensor],
     prefix: str,
 ) -> dict[str, torch.Tensor]:
-    if state_dict and all(
-        key.startswith(prefix)
-        for key in state_dict
-    ):
+    if state_dict and all(key.startswith(prefix) for key in state_dict):
         return {
             key[len(prefix):]: value
             for key, value in state_dict.items()
@@ -55,65 +36,56 @@ def _strip_prefix(
     return state_dict
 
 
-def _extract_state_dict(
-    checkpoint: Any,
-) -> dict[str, torch.Tensor]:
-    if isinstance(checkpoint, dict):
-        for key in (
-            "model_state_dict",
-            "state_dict",
-            "mst_state_dict",
-            "mst_model_state_dict",
-            "model",
-            "params",
-        ):
-            value = checkpoint.get(key)
-            if (
-                isinstance(value, dict)
-                and value
-                and all(
-                    torch.is_tensor(item)
-                    for item in value.values()
-                )
-            ):
-                state_dict = value
-                break
-        else:
-            if (
-                checkpoint
-                and all(
-                    torch.is_tensor(item)
-                    for item in checkpoint.values()
-                )
-            ):
-                state_dict = checkpoint
-            else:
-                raise KeyError(
-                    "Could not find an MST++ state_dict in the checkpoint."
-                )
-    else:
+def _extract_state_dict(checkpoint: Any) -> dict[str, torch.Tensor]:
+    if not isinstance(checkpoint, dict):
         raise TypeError(
             f"Unsupported checkpoint type: {type(checkpoint)}"
         )
 
-    state_dict = _strip_prefix(
-        state_dict,
+    state_dict = None
+
+    for key in (
+        "model_state_dict",
+        "state_dict",
+        "mst_state_dict",
+        "mst_model_state_dict",
+        "model",
+        "params",
+    ):
+        value = checkpoint.get(key)
+        if (
+            isinstance(value, dict)
+            and value
+            and all(torch.is_tensor(item) for item in value.values())
+        ):
+            state_dict = value
+            break
+
+    if state_dict is None:
+        if (
+            checkpoint
+            and all(torch.is_tensor(item) for item in checkpoint.values())
+        ):
+            state_dict = checkpoint
+        else:
+            raise KeyError(
+                "Could not find an MST++ state_dict in the checkpoint."
+            )
+
+    for prefix in (
         "module.",
-    )
-    state_dict = _strip_prefix(
-        state_dict,
         "mst_model.",
-    )
-    state_dict = _strip_prefix(
-        state_dict,
         "coarse_model.",
-    )
+    ):
+        state_dict = _strip_prefix(
+            state_dict,
+            prefix,
+        )
+
     return state_dict
 
 
-def _extract_tensor_output(
-    output: Any,
-) -> torch.Tensor:
+def _extract_tensor_output(output: Any) -> torch.Tensor:
     if torch.is_tensor(output):
         return output
 
@@ -149,10 +121,7 @@ def _extract_tensor_output(
 # ============================================================================
 
 class SinusoidalTimeEmbedding(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-    ):
+    def __init__(self, dim: int):
         super().__init__()
 
         if dim < 2:
@@ -162,10 +131,7 @@ class SinusoidalTimeEmbedding(nn.Module):
 
         self.dim = dim
 
-    def forward(
-        self,
-        timestep: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, timestep: torch.Tensor) -> torch.Tensor:
         half = self.dim // 2
 
         if half == 1:
@@ -185,10 +151,7 @@ class SinusoidalTimeEmbedding(nn.Module):
                 / (half - 1)
             )
 
-        angles = (
-            timestep[:, None]
-            * frequencies[None, :]
-        )
+        angles = timestep[:, None] * frequencies[None, :]
 
         embedding = torch.cat(
             [
@@ -201,32 +164,27 @@ class SinusoidalTimeEmbedding(nn.Module):
         if embedding.shape[-1] < self.dim:
             embedding = F.pad(
                 embedding,
-                (
-                    0,
-                    self.dim - embedding.shape[-1],
-                ),
+                (0, self.dim - embedding.shape[-1]),
             )
 
         return embedding
 
 
 # ============================================================================
-# MST-based residual denoiser
+# MST denoiser
 # ============================================================================
 
-class MSTResidualDenoiser(nn.Module):
+class MSTBBDMDenoiser(nn.Module):
     """
-    BBDM denoiser that uses the imported MST architecture.
+    Predict the standard BBDM bridge objective.
 
-    Input:
-        x_t:        Current Brownian-bridge state.
-        coarse_hsi: Frozen MST++ RGB-to-HSI prediction.
-        rgb:        RGB conditioning image.
-        t:          Integer diffusion timestep.
+    For the default ``grad`` objective:
 
-    Output:
-        Predicted residual:
-            ground_truth_hsi - coarse_hsi
+        target_objective = x_t - x_0
+
+    Therefore the clean HSI estimate is recovered as:
+
+        x_0_hat = x_t - predicted_objective
     """
 
     def __init__(
@@ -261,18 +219,11 @@ class MSTResidualDenoiser(nn.Module):
 
         self.time_mlp = nn.Sequential(
             SinusoidalTimeEmbedding(n_feat),
-            nn.Linear(
-                n_feat,
-                n_feat * 4,
-            ),
+            nn.Linear(n_feat, n_feat * 4),
             nn.GELU(),
-            nn.Linear(
-                n_feat * 4,
-                n_feat,
-            ),
+            nn.Linear(n_feat * 4, n_feat),
         )
 
-        # MST is imported directly from the existing MST++ model file.
         self.body = nn.Sequential(
             *[
                 MST(
@@ -319,28 +270,14 @@ class MSTResidualDenoiser(nn.Module):
                 "RGB and HSI tensors must have the same spatial size."
             )
 
-        if rgb.shape[1] != self.rgb_channels:
-            raise ValueError(
-                f"Expected {self.rgb_channels} RGB channels, "
-                f"but received {rgb.shape[1]}."
-            )
-
-        if x_t.shape[1] != self.hsi_channels:
-            raise ValueError(
-                f"Expected {self.hsi_channels} HSI channels, "
-                f"but received {x_t.shape[1]}."
-            )
-
         _, _, height, width = x_t.shape
 
         pad_height = (
-            self.pad_multiple
-            - height % self.pad_multiple
+            self.pad_multiple - height % self.pad_multiple
         ) % self.pad_multiple
 
         pad_width = (
-            self.pad_multiple
-            - width % self.pad_multiple
+            self.pad_multiple - width % self.pad_multiple
         ) % self.pad_multiple
 
         inputs = torch.cat(
@@ -355,44 +292,36 @@ class MSTResidualDenoiser(nn.Module):
         if pad_height or pad_width:
             padding_mode = (
                 "reflect"
-                if height > pad_height
-                and width > pad_width
+                if height > pad_height and width > pad_width
                 else "replicate"
             )
 
             inputs = F.pad(
                 inputs,
-                (
-                    0,
-                    pad_width,
-                    0,
-                    pad_height,
-                ),
+                (0, pad_width, 0, pad_height),
                 mode=padding_mode,
             )
 
         features = self.conv_in(inputs)
 
         normalized_timestep = (
-            t.float()
-            / float(total_steps)
+            t.float() / float(total_steps)
         )
 
         time_features = self.time_mlp(
             normalized_timestep
-        ).to(
-            dtype=features.dtype
-        )
+        ).to(features.dtype)
 
         features = (
             features
             + time_features[:, :, None, None]
         )
 
-        features = self.body(features)
-        predicted_residual = self.conv_out(features)
+        predicted_objective = self.conv_out(
+            self.body(features)
+        )
 
-        return predicted_residual[
+        return predicted_objective[
             :,
             :,
             :height,
@@ -401,19 +330,25 @@ class MSTResidualDenoiser(nn.Module):
 
 
 # ============================================================================
-# Standard residual Brownian bridge
+# Standard Brownian Bridge Diffusion Model
 # ============================================================================
 
-class ResidualBBDM(nn.Module):
+class BrownianBridgeDiffusion(nn.Module):
     """
-    Standard Brownian-bridge diffusion between:
+    Brownian bridge from the clean HSI x_0 to the frozen MST++ endpoint y.
 
-        x_0 = ground-truth HSI
-        x_T = coarse MST++ HSI
+    Forward process:
 
-    The denoiser predicts the residual:
+        x_t = (1 - m_t) x_0 + m_t y + sqrt(delta_t) epsilon
 
-        ground_truth_hsi - coarse_hsi
+    Standard ``grad`` training objective:
+
+        objective_t
+            = m_t (y - x_0) + sqrt(delta_t) epsilon
+            = x_t - x_0
+
+    The denoiser does not predict ``x_0 - y``. It predicts the timestep-
+    dependent Brownian-bridge objective.
     """
 
     def __init__(
@@ -468,17 +403,12 @@ class ResidualBBDM(nn.Module):
         t: torch.Tensor,
         reference: torch.Tensor,
     ) -> torch.Tensor:
-        selected = values.gather(
-            0,
-            t,
-        )
+        selected = values.gather(0, t)
 
         return selected.reshape(
             t.shape[0],
             *((1,) * (reference.ndim - 1)),
-        ).to(
-            dtype=reference.dtype
-        )
+        ).to(reference.dtype)
 
     def q_sample(
         self,
@@ -489,6 +419,7 @@ class ResidualBBDM(nn.Module):
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
     ]:
         if ground_truth.shape != coarse_hsi.shape:
             raise ValueError(
@@ -496,9 +427,7 @@ class ResidualBBDM(nn.Module):
             )
 
         if noise is None:
-            noise = torch.randn_like(
-                ground_truth
-            )
+            noise = torch.randn_like(ground_truth)
 
         m_t = self._extract(
             self.m_schedule,
@@ -510,16 +439,29 @@ class ResidualBBDM(nn.Module):
             t,
             ground_truth,
         )
-
-        x_t = (
-            (1.0 - m_t) * ground_truth
-            + m_t * coarse_hsi
-            + torch.sqrt(
-                delta_t.clamp_min(0.0)
-            ) * noise
+        sigma_t = torch.sqrt(
+            delta_t.clamp_min(0.0)
         )
 
-        return x_t, noise
+        target_objective = (
+            m_t * (coarse_hsi - ground_truth)
+            + sigma_t * noise
+        )
+
+        x_t = ground_truth + target_objective
+
+        return (
+            x_t,
+            target_objective,
+            noise,
+        )
+
+    @staticmethod
+    def predict_x0_from_objective(
+        x_t: torch.Tensor,
+        predicted_objective: torch.Tensor,
+    ) -> torch.Tensor:
+        return x_t - predicted_objective
 
     def training_predictions(
         self,
@@ -527,6 +469,7 @@ class ResidualBBDM(nn.Module):
         coarse_hsi: torch.Tensor,
         ground_truth: torch.Tensor,
         t: Optional[torch.Tensor] = None,
+        noise: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         batch_size = ground_truth.shape[0]
 
@@ -539,13 +482,18 @@ class ResidualBBDM(nn.Module):
                 dtype=torch.long,
             )
 
-        x_t, noise = self.q_sample(
+        (
+            x_t,
+            target_objective,
+            used_noise,
+        ) = self.q_sample(
             ground_truth=ground_truth,
             coarse_hsi=coarse_hsi,
             t=t,
+            noise=noise,
         )
 
-        predicted_residual = self.denoiser(
+        predicted_objective = self.denoiser(
             x_t=x_t,
             coarse_hsi=coarse_hsi,
             rgb=rgb,
@@ -553,22 +501,19 @@ class ResidualBBDM(nn.Module):
             total_steps=self.num_timesteps,
         )
 
-        target_residual = (
-            ground_truth
-            - coarse_hsi
-        )
-
         reconstruction = (
-            coarse_hsi
-            + predicted_residual
+            self.predict_x0_from_objective(
+                x_t=x_t,
+                predicted_objective=predicted_objective,
+            )
         )
 
         return {
             "t": t,
             "x_t": x_t,
-            "noise": noise,
-            "target_residual": target_residual,
-            "predicted_residual": predicted_residual,
+            "noise": used_noise,
+            "target_objective": target_objective,
+            "predicted_objective": predicted_objective,
             "reconstruction": reconstruction,
         }
 
@@ -580,9 +525,6 @@ class ResidualBBDM(nn.Module):
         clip_denoised: bool = True,
         stochastic: bool = False,
     ) -> torch.Tensor:
-        """
-        Reverse Brownian-bridge sampling from coarse HSI to refined HSI.
-        """
         x_t = coarse_hsi.clone()
         endpoint = coarse_hsi
         batch_size = coarse_hsi.shape[0]
@@ -599,7 +541,7 @@ class ResidualBBDM(nn.Module):
                 dtype=torch.long,
             )
 
-            predicted_residual = self.denoiser(
+            predicted_objective = self.denoiser(
                 x_t=x_t,
                 coarse_hsi=coarse_hsi,
                 rgb=rgb,
@@ -607,9 +549,9 @@ class ResidualBBDM(nn.Module):
                 total_steps=self.num_timesteps,
             )
 
-            x0_hat = (
-                coarse_hsi
-                + predicted_residual
+            x0_hat = self.predict_x0_from_objective(
+                x_t=x_t,
+                predicted_objective=predicted_objective,
             )
 
             if clip_denoised:
@@ -653,19 +595,17 @@ class ResidualBBDM(nn.Module):
                 + m_previous * endpoint
             )
 
+            # The endpoint at t=T is deterministic because delta_T=0.
             if step == self.num_timesteps:
-                posterior_mean = (
-                    previous_bridge_mean
-                )
-                posterior_variance = (
-                    delta_previous
-                )
+                posterior_mean = previous_bridge_mean
+                posterior_variance = delta_previous
             else:
+                denominator = (
+                    1.0 - m_previous
+                ).clamp_min(1e-8)
+
                 transition_scale = (
-                    (1.0 - m_t)
-                    / (
-                        1.0 - m_previous
-                    ).clamp_min(1e-8)
+                    (1.0 - m_t) / denominator
                 )
 
                 transition_variance = (
@@ -687,10 +627,7 @@ class ResidualBBDM(nn.Module):
                     )
                     * (
                         x_t
-                        - (
-                            1.0
-                            - transition_scale
-                        )
+                        - (1.0 - transition_scale)
                         * endpoint
                     )
                 )
@@ -704,9 +641,7 @@ class ResidualBBDM(nn.Module):
             if stochastic:
                 x_t = (
                     posterior_mean
-                    + torch.sqrt(
-                        posterior_variance
-                    )
+                    + torch.sqrt(posterior_variance)
                     * torch.randn_like(x_t)
                 )
             else:
@@ -716,21 +651,13 @@ class ResidualBBDM(nn.Module):
 
 
 # ============================================================================
-# Complete imported-MST++ + standard-BBDM model
+# Complete MST++ + BBDM model
 # ============================================================================
 
-class MSTPlusPlusResidualBBDM(nn.Module):
-    """
-    Complete RGB-to-HSI refinement model.
-
-    By default, this class creates MST_Plus_Plus directly from the imported
-    project architecture. An already-created MST++ module may still be passed
-    through coarse_model when needed.
-    """
-
+class MSTPlusPlusBBDM(nn.Module):
     def __init__(
         self,
-        bridge: ResidualBBDM,
+        bridge: BrownianBridgeDiffusion,
         coarse_model: Optional[nn.Module] = None,
         coarse_checkpoint: Optional[str | Path] = None,
         coarse_model_kwargs: Optional[dict[str, Any]] = None,
@@ -746,9 +673,7 @@ class MSTPlusPlusResidualBBDM(nn.Module):
 
         self.coarse_model = coarse_model
         self.bridge = bridge
-        self.freeze_coarse_model = (
-            freeze_coarse_model
-        )
+        self.freeze_coarse_model = freeze_coarse_model
 
         if coarse_checkpoint is not None:
             checkpoint = _load_checkpoint(
@@ -764,21 +689,14 @@ class MSTPlusPlusResidualBBDM(nn.Module):
             )
 
         if self.freeze_coarse_model:
-            # Keep the frozen MST++ branch in FP32. This avoids reduced-
-            # precision cuDNN failures in some MST++ depthwise convolutions.
             self.coarse_model.float()
 
-            for parameter in (
-                self.coarse_model.parameters()
-            ):
+            for parameter in self.coarse_model.parameters():
                 parameter.requires_grad_(False)
 
             self.coarse_model.eval()
 
-    def train(
-        self,
-        mode: bool = True,
-    ):
+    def train(self, mode: bool = True):
         super().train(mode)
 
         if self.freeze_coarse_model:
@@ -798,12 +716,10 @@ class MSTPlusPlusResidualBBDM(nn.Module):
                     device_type=rgb.device.type,
                     enabled=False,
                 ):
-                    coarse_output = (
-                        self.coarse_model(
-                            rgb.detach()
-                            .float()
-                            .contiguous()
-                        )
+                    coarse_output = self.coarse_model(
+                        rgb.detach()
+                        .float()
+                        .contiguous()
                     )
 
             coarse_hsi = _extract_tensor_output(
@@ -814,7 +730,6 @@ class MSTPlusPlusResidualBBDM(nn.Module):
                 self.coarse_model(rgb)
             )
 
-        # Some MST++ implementations pad internally. Crop back to the RGB size.
         coarse_hsi = coarse_hsi[
             :,
             :,
@@ -834,9 +749,9 @@ class MSTPlusPlusResidualBBDM(nn.Module):
 
         if coarse_hsi.shape != ground_truth.shape:
             raise ValueError(
-                "The imported MST++ output and ground-truth HSI must have "
-                f"the same shape, but received {coarse_hsi.shape} and "
-                f"{ground_truth.shape}."
+                "The MST++ output and ground-truth HSI must have "
+                f"the same shape, but received {coarse_hsi.shape} "
+                f"and {ground_truth.shape}."
             )
 
         outputs = self.bridge.training_predictions(
@@ -845,8 +760,8 @@ class MSTPlusPlusResidualBBDM(nn.Module):
             ground_truth=ground_truth,
             t=t,
         )
-
         outputs["coarse_hsi"] = coarse_hsi
+
         return outputs
 
     @torch.no_grad()
@@ -855,10 +770,7 @@ class MSTPlusPlusResidualBBDM(nn.Module):
         rgb: torch.Tensor,
         clip_denoised: bool = True,
         stochastic: bool = False,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-    ]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         coarse_hsi = self.get_coarse(rgb)
 
         refined_hsi = self.bridge.sample(
@@ -870,10 +782,6 @@ class MSTPlusPlusResidualBBDM(nn.Module):
 
         return coarse_hsi, refined_hsi
 
-
-# ============================================================================
-# Convenience constructor
-# ============================================================================
 
 def build_mst_bbdm(
     coarse_checkpoint: Optional[str | Path] = None,
@@ -887,8 +795,8 @@ def build_mst_bbdm(
     num_timesteps: int = 50,
     midpoint_variance: float = 0.05,
     freeze_coarse_model: bool = True,
-) -> MSTPlusPlusResidualBBDM:
-    denoiser = MSTResidualDenoiser(
+) -> MSTPlusPlusBBDM:
+    denoiser = MSTBBDMDenoiser(
         hsi_channels=hsi_channels,
         rgb_channels=rgb_channels,
         n_feat=n_feat,
@@ -897,13 +805,13 @@ def build_mst_bbdm(
         num_blocks=num_blocks,
     )
 
-    bridge = ResidualBBDM(
+    bridge = BrownianBridgeDiffusion(
         denoiser=denoiser,
         num_timesteps=num_timesteps,
         midpoint_variance=midpoint_variance,
     )
 
-    return MSTPlusPlusResidualBBDM(
+    return MSTPlusPlusBBDM(
         bridge=bridge,
         coarse_model=None,
         coarse_checkpoint=coarse_checkpoint,
