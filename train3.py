@@ -1,13 +1,11 @@
-"""Train the MST++-conditioned residual Brownian-bridge diffusion model.
+"""Train the MST++-conditioned standard Brownian Bridge Diffusion Model.
 
-A pretrained MST++ model produces a frozen coarse HSI estimate. The trainable
-Brownian-bridge denoiser predicts the correction residual
+The frozen MST++ prediction is the Brownian-bridge endpoint. The trainable
+denoiser predicts the standard timestep-dependent BBDM objective
 
-    ground_truth_hsi - coarse_hsi
+    target_objective = x_t - ground_truth_hsi
 
-and reconstructs
-
-    coarse_hsi + predicted_residual.
+rather than the fixed residual between ground truth and MST++ output.
 
 The dataset, validation, metric, checkpoint, AMP, and visualization structure is
 kept aligned with the supplied training script. Visualization remains enabled
@@ -40,9 +38,9 @@ from torch.utils.data import DataLoader, Dataset
 # RBBDM_rgb2hsi imports MST and MST_Plus_Plus internally from the existing
 # MST++ architecture file.
 from model.BBDM_from_mstpp import (
-    MSTResidualDenoiser,
-    ResidualBBDM,
-    MSTPlusPlusResidualBBDM,
+    MSTBBDMDenoiser,
+    BrownianBridgeDiffusion,
+    MSTPlusPlusBBDM,
 )
 
 from loss.mrae import mrae
@@ -77,7 +75,7 @@ VALIDATION_RGB_DIR = (
     "/kaggle/input/datasets/sriramhari14/ntire-2022/Valid_RGB/Valid_RGB"
 )
 
-# Pretrained frozen MST++ checkpoint and residual-diffusion outputs.
+# Pretrained frozen MST++ checkpoint and BBDM outputs.
 MST_CHECKPOINT = "./mst_checkpoints/mst_plus_plus.pth"
 OUTPUT_DIR = "./mst_bbdm_checkpoints"
 
@@ -127,11 +125,11 @@ CLAMP_PREDICTION_FOR_METRICS = False
 INFERENCE_CLIP_DENOISED = True
 INFERENCE_STOCHASTIC = False
 
-# Residual Brownian-bridge architecture.
+# Standard Brownian-bridge architecture.
 HSI_CHANNELS = 31
 RGB_CHANNELS = 3
-RESIDUAL_N_FEAT = 31
-RESIDUAL_BODY_DEPTH = 3
+BBDM_N_FEAT = 31
+BBDM_BODY_DEPTH = 3
 MST_DENOISER_STAGE = 2
 MST_DENOISER_NUM_BLOCKS = (1, 1, 1)
 NUM_DIFFUSION_STEPS = 50
@@ -173,18 +171,17 @@ USE_AUGMENTATION = True
 SEED = 42
 PRINT_EVERY = 30
 
-# Main objective from the residual-prediction model.
-# The residual network predicts the clean correction residual directly.
-RESIDUAL_L1_WEIGHT = 1.0
+# Standard BBDM objective loss. The network predicts x_t - x_0.
+OBJECTIVE_L1_WEIGHT = 1.0
 
-# Optional direct L1 loss on the refined HSI reconstruction.
+# Optional direct L1 loss on the recovered clean HSI.
 RECONSTRUCTION_L1_WEIGHT = 0.0
 
 # Actual RGB -> HSI reconstruction metrics require iterative diffusion sampling.
 # None evaluates every validation image. A positive integer limits cost.
 VALIDATION_METRIC_MAX_IMAGES: Optional[int] = 20
 
-# Training metrics use the single-step clean-residual estimate at the sampled t.
+# Training metrics use the one-step x_0 estimate recovered at the sampled t.
 COMPUTE_TRAIN_ONE_STEP_METRICS = True
 TRAIN_METRIC_EVERY = 1
 
@@ -1374,7 +1371,7 @@ class HSIRGBPairDataset(Dataset):
 
 
 # ============================================================================
-# Residual-diffusion construction and checkpoint handling
+# BBDM construction and checkpoint handling
 # ============================================================================
 
 def _load_torch_checkpoint(
@@ -1429,7 +1426,7 @@ def _extract_state_dict(
             return _strip_module_prefix(checkpoint)
 
     raise KeyError(
-        "Could not locate a residual-diffusion state_dict in the checkpoint."
+        "Could not locate a BBDM state_dict in the checkpoint."
     )
 
 
@@ -1437,8 +1434,8 @@ def default_model_config() -> dict:
     return {
         "hsi_channels": HSI_CHANNELS,
         "rgb_channels": RGB_CHANNELS,
-        "n_feat": RESIDUAL_N_FEAT,
-        "body_depth": RESIDUAL_BODY_DEPTH,
+        "n_feat": BBDM_N_FEAT,
+        "body_depth": BBDM_BODY_DEPTH,
         "mst_stage": MST_DENOISER_STAGE,
         "num_blocks": tuple(MST_DENOISER_NUM_BLOCKS),
         "num_timesteps": NUM_DIFFUSION_STEPS,
@@ -1446,10 +1443,10 @@ def default_model_config() -> dict:
     }
 
 
-def build_residual_diffusion(
+def build_bbdm(
     device: torch.device,
     model_config: Optional[dict] = None,
-) -> MSTPlusPlusResidualBBDM:
+) -> MSTPlusPlusBBDM:
     config = default_model_config()
 
     if model_config is not None:
@@ -1457,7 +1454,7 @@ def build_residual_diffusion(
             if key in model_config:
                 config[key] = model_config[key]
 
-    denoiser = MSTResidualDenoiser(
+    denoiser = MSTBBDMDenoiser(
         hsi_channels=config["hsi_channels"],
         rgb_channels=config["rgb_channels"],
         n_feat=config["n_feat"],
@@ -1466,7 +1463,7 @@ def build_residual_diffusion(
         num_blocks=tuple(config["num_blocks"]),
     )
 
-    bridge = ResidualBBDM(
+    bridge = BrownianBridgeDiffusion(
         denoiser=denoiser,
         num_timesteps=config["num_timesteps"],
         midpoint_variance=config["midpoint_variance"],
@@ -1474,7 +1471,7 @@ def build_residual_diffusion(
 
     # The model wrapper now creates MST_Plus_Plus internally from the import
     # in RBBDM_rgb2hsi.py and loads the pretrained coarse checkpoint itself.
-    model = MSTPlusPlusResidualBBDM(
+    model = MSTPlusPlusBBDM(
         bridge=bridge,
         coarse_model=None,
         coarse_checkpoint=MST_CHECKPOINT,
@@ -1488,12 +1485,12 @@ def build_residual_diffusion(
 
 def save_checkpoint(
     output_path: Path,
-    model: MSTPlusPlusResidualBBDM,
+    model: MSTPlusPlusBBDM,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler: GradScaler,
     epoch: int,
-    best_validation_residual_loss: float,
+    best_validation_objective_loss: float,
     validation_metrics: dict,
 ) -> None:
     output_path.parent.mkdir(
@@ -1508,8 +1505,8 @@ def save_checkpoint(
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
-            "best_validation_residual_loss": (
-                best_validation_residual_loss
+            "best_validation_objective_loss": (
+                best_validation_objective_loss
             ),
             "validation_metrics": validation_metrics,
             "model_config": default_model_config(),
@@ -1519,14 +1516,15 @@ def save_checkpoint(
     )
 
 
-def load_residual_diffusion_weights(
-    model: MSTPlusPlusResidualBBDM,
+def load_bbdm_weights(
+    model: MSTPlusPlusBBDM,
     checkpoint,
 ) -> None:
     state_dict = _extract_state_dict(
         checkpoint,
         candidate_keys=(
             "model_state_dict",
+            "bbdm_state_dict",
             "residual_bbdm_state_dict",
             "state_dict",
         ),
@@ -1572,7 +1570,7 @@ def _extract_tensor_output(output) -> torch.Tensor:
 
 @torch.no_grad()
 def get_coarse_prediction_fp32(
-    model: MSTPlusPlusResidualBBDM,
+    model: MSTPlusPlusBBDM,
     rgb: torch.Tensor,
 ) -> torch.Tensor:
     """
@@ -1585,7 +1583,7 @@ def get_coarse_prediction_fp32(
 
 
 # ============================================================================
-# Residual diffusion
+# Standard Brownian-bridge diffusion
 # ============================================================================
 
 def sample_training_timesteps(
@@ -1605,29 +1603,26 @@ def sample_training_timesteps(
 def calculate_training_losses(
     outputs: Dict[str, torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    residual_l1_loss = F.l1_loss(
-        outputs["predicted_residual"].float(),
-        outputs["target_residual"].float(),
+    objective_l1_loss = F.l1_loss(
+        outputs["predicted_objective"].float(),
+        outputs["target_objective"].float(),
     )
 
     reconstruction_l1_loss = F.l1_loss(
         outputs["reconstruction"].float(),
-        (
-            outputs["coarse_hsi"]
-            + outputs["target_residual"]
-        ).float(),
+        outputs["ground_truth"].float(),
     )
 
     total_loss = (
-        RESIDUAL_L1_WEIGHT
-        * residual_l1_loss
+        OBJECTIVE_L1_WEIGHT
+        * objective_l1_loss
         + RECONSTRUCTION_L1_WEIGHT
         * reconstruction_l1_loss
     )
 
     return (
         total_loss,
-        residual_l1_loss,
+        objective_l1_loss,
         reconstruction_l1_loss,
     )
 
@@ -1820,12 +1815,12 @@ def create_timestep_tracker(
 def update_timestep_tracker(
     tracker: dict,
     timestep: torch.Tensor,
-    predicted_residual: torch.Tensor,
-    target_residual: torch.Tensor,
+    predicted_objective: torch.Tensor,
+    target_objective: torch.Tensor,
 ) -> None:
     per_sample_loss = F.l1_loss(
-        predicted_residual.detach().float(),
-        target_residual.detach().float(),
+        predicted_objective.detach().float(),
+        target_objective.detach().float(),
         reduction="none",
     ).mean(dim=(1, 2, 3))
 
@@ -1851,7 +1846,7 @@ def finalize_timestep_tracker(
     for step, values in tracker.items():
         count = values["count"]
         result[str(step)] = {
-            "residual_l1": (
+            "objective_l1": (
                 values["loss_sum"] / count
                 if count > 0
                 else float("nan")
@@ -1870,7 +1865,7 @@ def print_timestep_tracker(
 
     for step, values in result.items():
         count = values["count"]
-        loss = values["residual_l1"]
+        loss = values["objective_l1"]
 
         if count == 0:
             print(
@@ -1879,7 +1874,7 @@ def print_timestep_tracker(
         else:
             print(
                 f"  t={step} | "
-                f"residual L1={loss:.6f} | "
+                f"objective L1={loss:.6f} | "
                 f"samples={count}"
             )
 
@@ -1889,7 +1884,7 @@ def print_timestep_tracker(
 # ============================================================================
 
 def train_one_epoch(
-    model: MSTPlusPlusResidualBBDM,
+    model: MSTPlusPlusBBDM,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
@@ -1905,7 +1900,7 @@ def train_one_epoch(
     ]
 
     total_loss_sum = 0.0
-    residual_l1_sum = 0.0
+    objective_l1_sum = 0.0
     reconstruction_l1_sum = 0.0
     total_samples = 0
 
@@ -1965,10 +1960,11 @@ def train_one_epoch(
                 t=timestep,
             )
             outputs["coarse_hsi"] = coarse_hsi
+            outputs["ground_truth"] = hsi
 
             (
                 loss,
-                residual_l1_loss,
+                objective_l1_loss,
                 reconstruction_l1_loss,
             ) = calculate_training_losses(
                 outputs
@@ -2021,12 +2017,12 @@ def train_one_epoch(
                 f"loss={float(loss.detach()):.6g}, "
                 f"t=[{int(timestep.min())}, "
                 f"{int(timestep.max())}], "
-                f"|target residual|max="
-                f"{float(outputs['target_residual'].detach().abs().max()):.4g}, "
+                f"|target objective|max="
+                f"{float(outputs['target_objective'].detach().abs().max()):.4g}, "
                 f"|x_t|max="
                 f"{float(outputs['x_t'].detach().abs().max()):.4g}, "
-                f"|predicted residual|max="
-                f"{float(outputs['predicted_residual'].detach().abs().max()):.4g}, "
+                f"|predicted objective|max="
+                f"{float(outputs['predicted_objective'].detach().abs().max()):.4g}, "
                 f"AMP scale {old_scale:.1f} -> {new_scale:.1f}."
             )
 
@@ -2038,7 +2034,7 @@ def train_one_epoch(
                     "Persistent non-finite gradients: "
                     f"{consecutive_nonfinite_batches} consecutive "
                     "batches failed. Reduce LEARNING_RATE, disable AMP, "
-                    "and inspect the printed input/residual magnitudes."
+                    "and inspect the printed input/bridge-objective magnitudes."
                 )
 
             continue
@@ -2051,8 +2047,8 @@ def train_one_epoch(
         update_timestep_tracker(
             tracker=timestep_tracker,
             timestep=outputs["t"].detach(),
-            predicted_residual=outputs["predicted_residual"],
-            target_residual=outputs["target_residual"],
+            predicted_objective=outputs["predicted_objective"],
+            target_objective=outputs["target_objective"],
         )
 
         batch_size = hsi.shape[0]
@@ -2060,8 +2056,8 @@ def train_one_epoch(
             loss.detach().item()
             * batch_size
         )
-        residual_l1_sum += (
-            residual_l1_loss.detach().item()
+        objective_l1_sum += (
+            objective_l1_loss.detach().item()
             * batch_size
         )
         reconstruction_l1_sum += (
@@ -2091,7 +2087,7 @@ def train_one_epoch(
                 f"  Batch {batch_index:04d}/"
                 f"{len(loader):04d} | "
                 f"total={total_loss_sum / total_samples:.6f} | "
-                f"residual L1={residual_l1_sum / total_samples:.6f} | "
+                f"objective L1={objective_l1_sum / total_samples:.6f} | "
                 f"reconstruction L1="
                 f"{reconstruction_l1_sum / total_samples:.6f} | "
                 f"grad={float(gradient_norm):.4f}"
@@ -2125,8 +2121,8 @@ def train_one_epoch(
         "total_loss": (
             total_loss_sum / total_samples
         ),
-        "residual_l1": (
-            residual_l1_sum / total_samples
+        "objective_l1": (
+            objective_l1_sum / total_samples
         ),
         "reconstruction_l1": (
             reconstruction_l1_sum / total_samples
@@ -2156,7 +2152,7 @@ def train_one_epoch(
 
 @torch.no_grad()
 def validate_diffusion_loss(
-    model: MSTPlusPlusResidualBBDM,
+    model: MSTPlusPlusBBDM,
     loader: DataLoader,
     device: torch.device,
     use_amp: bool,
@@ -2164,7 +2160,7 @@ def validate_diffusion_loss(
     model.eval()
 
     total_loss_sum = 0.0
-    residual_l1_sum = 0.0
+    objective_l1_sum = 0.0
     reconstruction_l1_sum = 0.0
     total_samples = 0
     sample_offset = 0
@@ -2218,43 +2214,54 @@ def validate_diffusion_loss(
             device=device,
             enabled=use_amp,
         ):
-            x_t, used_noise = model.bridge.q_sample(
+            (
+                x_t,
+                target_objective,
+                used_noise,
+            ) = model.bridge.q_sample(
                 ground_truth=hsi,
                 coarse_hsi=coarse_hsi,
                 t=timestep,
                 noise=noise,
             )
-            predicted_residual = model.bridge.denoiser(
+
+            predicted_objective = model.bridge.denoiser(
                 x_t=x_t,
                 coarse_hsi=coarse_hsi,
                 rgb=rgb,
                 t=timestep,
                 total_steps=model.bridge.num_timesteps,
             )
-            target_residual = hsi - coarse_hsi
-            reconstruction = coarse_hsi + predicted_residual
+
+            reconstruction = (
+                model.bridge.predict_x0_from_objective(
+                    x_t=x_t,
+                    predicted_objective=predicted_objective,
+                )
+            )
 
             outputs = {
                 "t": timestep,
                 "x_t": x_t,
                 "noise": used_noise,
-                "target_residual": target_residual,
-                "predicted_residual": predicted_residual,
+                "target_objective": target_objective,
+                "predicted_objective": predicted_objective,
                 "reconstruction": reconstruction,
                 "coarse_hsi": coarse_hsi,
+                "ground_truth": hsi,
             }
 
             (
                 _,
-                residual_l1_loss,
+                objective_l1_loss,
                 reconstruction_l1_loss,
             ) = calculate_training_losses(
                 outputs
             )
 
-        per_sample_residual_l1 = F.l1_loss(
-            outputs["predicted_residual"].float(),
-            outputs["target_residual"].float(),
+        per_sample_objective_l1 = F.l1_loss(
+            outputs["predicted_objective"].float(),
+            outputs["target_objective"].float(),
             reduction="none",
         ).mean(dim=(1, 2, 3))
 
@@ -2265,14 +2272,14 @@ def validate_diffusion_loss(
         ).mean(dim=(1, 2, 3))
 
         per_sample_total = (
-            RESIDUAL_L1_WEIGHT
-            * per_sample_residual_l1
+            OBJECTIVE_L1_WEIGHT
+            * per_sample_objective_l1
             + RECONSTRUCTION_L1_WEIGHT
             * per_sample_reconstruction_l1
         )
 
         total_loss_sum += per_sample_total.sum().item()
-        residual_l1_sum += per_sample_residual_l1.sum().item()
+        objective_l1_sum += per_sample_objective_l1.sum().item()
         reconstruction_l1_sum += (
             per_sample_reconstruction_l1.sum().item()
         )
@@ -2281,16 +2288,16 @@ def validate_diffusion_loss(
         update_timestep_tracker(
             tracker=timestep_tracker,
             timestep=timestep,
-            predicted_residual=outputs["predicted_residual"],
-            target_residual=outputs["target_residual"],
+            predicted_objective=outputs["predicted_objective"],
+            target_objective=outputs["target_objective"],
         )
 
     return {
         "total_loss": (
             total_loss_sum / total_samples
         ),
-        "residual_l1": (
-            residual_l1_sum / total_samples
+        "objective_l1": (
+            objective_l1_sum / total_samples
         ),
         "reconstruction_l1": (
             reconstruction_l1_sum / total_samples
@@ -2305,7 +2312,7 @@ def validate_diffusion_loss(
 
 @torch.no_grad()
 def validate_reconstruction_metrics(
-    model: MSTPlusPlusResidualBBDM,
+    model: MSTPlusPlusBBDM,
     loader: DataLoader,
     device: torch.device,
     use_amp: bool,
@@ -2557,7 +2564,7 @@ def save_inference_preview(
 
 @torch.no_grad()
 def run_random_validation_inference(
-    model: MSTPlusPlusResidualBBDM,
+    model: MSTPlusPlusBBDM,
     validation_pairs: Sequence[
         Tuple[Path, Path]
     ],
@@ -2735,10 +2742,6 @@ def run_random_validation_inference(
             str(prefix) + ".npz",
             prediction=prediction_numpy,
             mst_prediction=mst_prediction_numpy,
-            predicted_residual=(
-                prediction_numpy
-                - mst_prediction_numpy
-            ),
             target=target_numpy,
             rgb=rgb_numpy,
             hsi_path=hsi_path_string,
@@ -2935,7 +2938,7 @@ def train_workflow(
         Tuple[Path, Path]
     ],
     output_directory: Path,
-) -> MSTPlusPlusResidualBBDM:
+) -> MSTPlusPlusBBDM:
     if TRAIN_CROP_SIZE % MODEL_DOWNSAMPLE_FACTOR != 0:
         raise ValueError(
             f"TRAIN_CROP_SIZE={TRAIN_CROP_SIZE} must be divisible by "
@@ -2978,7 +2981,7 @@ def train_workflow(
         device=device,
     )
 
-    model = build_residual_diffusion(
+    model = build_bbdm(
         device=device,
     )
 
@@ -3000,7 +3003,7 @@ def train_workflow(
         f"Training pairs: {len(train_pairs)}\n"
         f"Validation pairs: {len(validation_pairs)}\n"
         f"Frozen MST++ parameters: {frozen_mst_parameters:,}\n"
-        f"Trainable residual parameters: "
+        f"Trainable BBDM parameters: "
         f"{sum(p.numel() for p in trainable_parameters):,}"
     )
 
@@ -3035,7 +3038,7 @@ def train_workflow(
     )
 
     start_epoch = 1
-    best_validation_residual_loss = float("inf")
+    best_validation_objective_loss = float("inf")
 
     if RESUME_CHECKPOINT is not None:
         resume_checkpoint = (
@@ -3045,7 +3048,7 @@ def train_workflow(
             )
         )
 
-        load_residual_diffusion_weights(
+        load_bbdm_weights(
             model,
             resume_checkpoint,
         )
@@ -3102,10 +3105,13 @@ def train_workflow(
             )
         ) + 1
 
-        best_validation_residual_loss = float(
+        best_validation_objective_loss = float(
             resume_checkpoint.get(
-                "best_validation_residual_loss",
-                float("inf"),
+                "best_validation_objective_loss",
+                resume_checkpoint.get(
+                    "best_validation_residual_loss",
+                    float("inf"),
+                ),
             )
         )
 
@@ -3162,11 +3168,11 @@ def train_workflow(
             f"\nEpoch {epoch:03d}/{NUM_EPOCHS:03d} | "
             f"LR={current_learning_rate:.2e} | "
             f"train total={train_metrics['total_loss']:.6f} | "
-            f"train residual L1={train_metrics['residual_l1']:.6f} | "
+            f"train objective L1={train_metrics['objective_l1']:.6f} | "
             f"skipped overflow batches="
             f"{train_metrics['skipped_nonfinite_batches']} | "
-            f"validation residual L1="
-            f"{validation_diffusion['residual_l1']:.6f}"
+            f"validation objective L1="
+            f"{validation_diffusion['objective_l1']:.6f}"
         )
 
         if "one_step_psnr" in train_metrics:
@@ -3199,13 +3205,13 @@ def train_workflow(
         )
 
         print_timestep_tracker(
-            title="Training residual L1 by timestep",
+            title="Training objective L1 by timestep",
             result=train_metrics[
                 "timestep_losses"
             ],
         )
         print_timestep_tracker(
-            title="Validation residual L1 by timestep",
+            title="Validation objective L1 by timestep",
             result=validation_diffusion[
                 "timestep_losses"
             ],
@@ -3228,8 +3234,8 @@ def train_workflow(
             scheduler=scheduler,
             scaler=scaler,
             epoch=epoch,
-            best_validation_residual_loss=(
-                best_validation_residual_loss
+            best_validation_objective_loss=(
+                best_validation_objective_loss
             ),
             validation_metrics=(
                 combined_validation_metrics
@@ -3237,11 +3243,11 @@ def train_workflow(
         )
 
         if (
-            validation_diffusion["residual_l1"]
-            < best_validation_residual_loss
+            validation_diffusion["objective_l1"]
+            < best_validation_objective_loss
         ):
-            best_validation_residual_loss = (
-                validation_diffusion["residual_l1"]
+            best_validation_objective_loss = (
+                validation_diffusion["objective_l1"]
             )
 
             save_checkpoint(
@@ -3254,8 +3260,8 @@ def train_workflow(
                 scheduler=scheduler,
                 scaler=scaler,
                 epoch=epoch,
-                best_validation_residual_loss=(
-                    best_validation_residual_loss
+                best_validation_objective_loss=(
+                    best_validation_objective_loss
                 ),
                 validation_metrics=(
                     combined_validation_metrics
@@ -3264,8 +3270,8 @@ def train_workflow(
 
             print(
                 "New best checkpoint | "
-                f"validation residual L1="
-                f"{best_validation_residual_loss:.6f}"
+                f"validation objective L1="
+                f"{best_validation_objective_loss:.6f}"
             )
 
     return model
@@ -3274,7 +3280,7 @@ def train_workflow(
 def load_model_for_inference(
     checkpoint_path: str,
     device: torch.device,
-) -> MSTPlusPlusResidualBBDM:
+) -> MSTPlusPlusBBDM:
     checkpoint = _load_torch_checkpoint(
         checkpoint_path,
         device="cpu",
@@ -3286,12 +3292,12 @@ def load_model_for_inference(
         else {}
     )
 
-    model = build_residual_diffusion(
+    model = build_bbdm(
         device=device,
         model_config=model_config,
     )
 
-    load_residual_diffusion_weights(
+    load_bbdm_weights(
         model,
         checkpoint,
     )
@@ -3303,7 +3309,7 @@ def load_model_for_inference(
 def parse_command_line_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Train or evaluate the frozen-MST++ residual Brownian-bridge model."
+            "Train or evaluate the frozen-MST++ standard Brownian-bridge model."
         )
     )
     parser.add_argument(
