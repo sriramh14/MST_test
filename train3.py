@@ -1,133 +1,200 @@
-"""Full-resolution training and inference for a frozen MST++ + residual BBDM pipeline.
+"""Train the MST++-conditioned residual Brownian-bridge diffusion model.
 
-The pretrained MST++ model produces a coarse HSI and remains completely frozen.
-Only the Brownian-bridge residual denoiser is optimized.
+A pretrained MST++ model produces a frozen coarse HSI estimate. The trainable
+Brownian-bridge denoiser predicts the correction residual
 
-Edit the configuration section, then run one of:
+    ground_truth_hsi - coarse_hsi
 
-    python train_mstpp_residual_bbdm.py --mode train
-    python train_mstpp_residual_bbdm.py --mode infer
+and reconstructs
 
-The parser intentionally contains no argument other than ``--mode``.
+    coarse_hsi + predicted_residual.
+
+The dataset, validation, metric, checkpoint, AMP, and visualization structure is
+kept aligned with the supplied training script. Visualization remains enabled
+only through the --visualize command-line flag.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
-import math
 import random
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import h5py
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import scipy.io as sio
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
+from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader, Dataset
 
-from model.MST_Plus_Plus import MST, MST_Plus_Plus
+
+# ============================================================================
+# Project imports
+# ============================================================================
+# Adjust only these import paths if your project layout is different.
+# Adjust these paths/classes to match your project layout.
+from model.MST_Plus_Plus import MST_Plus_Plus
+from model.RBBDM_rgb2hsi import (
+    MSTResidualDenoiser,
+    ResidualBBDM,
+    MSTPlusPlusResidualBBDM,
+)
+
+from loss.mrae import mrae
+from loss.psnr import psnr
+from loss.rmse import rmse
+from loss.sam import sam
+from loss.ssim import ssim
 
 
-# ============================================================
-# Configuration: edit values here, not on the command line
-# ============================================================
+# ============================================================================
+# Configuration
+# ============================================================================
 
-# Data paths
-HSI_DATA_DIR = "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_spectral/Train_spectral"
-RGB_DATA_DIR = "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_RGB/Train_RGB"
-OUTPUT_DIR = "./mstpp_bbdm_checkpoints"
+# "train", "infer", or "train_and_infer"
+RUN_MODE = "train"
 
-# Pretrained frozen MST++ checkpoint
-MSTPP_CHECKPOINT = "./mstpp_checkpoints/mst_plus_plus.pth"
+# Training data.
+TRAIN_HSI_DIR = (
+    "/kaggle/input/datasets/sriramhari14/ntire-2022/"
+    "Train_spectral/Train_spectral"
+)
+TRAIN_RGB_DIR = (
+    "/kaggle/input/datasets/sriramhari14/ntire-2022/"
+    "Train_RGB/Train_RGB"
+)
 
-# HSI data settings
-HSI_CHANNELS = 31
-HSI_KEY = "cube"
-NORMALIZATION = "none"          # "none" or "minmax"
+# Validation data is intentionally in a separate pair of folders.
+VALIDATION_HSI_DIR = (
+    "/kaggle/input/datasets/sriramhari14/ntire-2022/Valid_spectral/Valid_spectral"
+)
+VALIDATION_RGB_DIR = (
+    "/kaggle/input/datasets/sriramhari14/ntire-2022/Valid_RGB/Valid_RGB"
+)
 
-# Frozen MST++ fallback settings. Values stored in its checkpoint take priority.
-MSTPP_STAGES = 3
-MSTPP_FEATURES = 31
+# Pretrained frozen MST++ checkpoint and residual-diffusion outputs.
+MST_CHECKPOINT = "./mst_checkpoints/mst_plus_plus.pth"
+OUTPUT_DIR = "./mst_bbdm_checkpoints"
 
-# Brownian-bridge denoiser settings
-BBDM_TIMESTEPS = 20
-BBDM_MIDPOINT_VARIANCE = 0.05
-BBDM_FEATURES = 31
-BBDM_BODY_DEPTH = 3
-BBDM_MST_STAGE = 2
-BBDM_NUM_BLOCKS = (1, 1, 1)
+# Add constructor arguments required by your MST++ implementation here.
+MST_MODEL_KWARGS: Dict[str, Any] = {}
+STRICT_MST_CHECKPOINT = True
 
-# Training settings
-EPOCHS = 75
-# Keep this at 1 when full-resolution images have different spatial sizes.
-BATCH_SIZE = 1
-NUM_WORKERS = 4
-LEARNING_RATE = 2e-4
-MIN_LEARNING_RATE = 1e-7
-WEIGHT_DECAY = 1e-4
-VALIDATION_FRACTION = 0.1
-USE_AUGMENTATION = True
-USE_AMP = True
-AMP_INITIAL_SCALE = 1024.0
-GRADIENT_CLIP_NORM = 1.0
-PRINT_EVERY = 30
-SEED = 42
+# Dataset-validation caches. They are reused while the HSI file paths,
+# sizes, and modification times remain unchanged.
+TRAIN_PAIR_VALIDATION_CACHE = (
+    Path(OUTPUT_DIR) / "training_pair_validation_cache.pth"
+)
+VALIDATION_PAIR_VALIDATION_CACHE = (
+    Path(OUTPUT_DIR) / "validation_pair_validation_cache.pth"
+)
 
-# The loss is applied only to the BBDM output. MST++ receives no gradients.
-RESIDUAL_LOSS_WEIGHT = 1.0
-RECONSTRUCTION_LOSS_WEIGHT = 0.5
-SPECTRAL_LOSS_WEIGHT = 0.1
-SMOOTH_L1_BETA = 0.01
-
-# "endpoint" validates with one denoiser pass at t=T, where x_T=coarse HSI.
-# "sample" runs the complete reverse bridge and is much more expensive.
-VALIDATION_MODE = "endpoint"    # "endpoint" or "sample"
-VALIDATION_STOCHASTIC = False
-
-# Stable metric settings. NTIRE spectral cubes are normally in [0, 1].
-MRAE_EPSILON = 1e-3
-SAM_EPSILON = 1e-8
-METRIC_DATA_RANGE = 1.0
-SSIM_WINDOW_SIZE = 11
-SSIM_SIGMA = 1.5
-REPORT_SAM_IN_DEGREES = False
-WARN_ON_RANGE_MISMATCH = True
-
-# Leave as None to start BBDM training from epoch 1.
+# Used by RUN_MODE="infer". The best checkpoint is normally selected here.
+INFERENCE_CHECKPOINT = (
+    "./mst_bbdm_checkpoints/best_bbdm.pth"
+)
 RESUME_CHECKPOINT: Optional[str] = None
-# Example:
-# RESUME_CHECKPOINT = "./mstpp_bbdm_checkpoints/last_bbdm.pth"
 
-# Inference settings
-INFERENCE_BBDM_CHECKPOINT = "./mstpp_bbdm_checkpoints/best_bbdm.pth"
-INFERENCE_RGB_PATH = "./test_rgb.png"
-INFERENCE_HSI_PATH: Optional[str] = "./test_hsi.mat"
-INFERENCE_OUTPUT_DIR = "./mstpp_bbdm_results"
-CLAMP_INFERENCE_OUTPUT = True
+# When recovering from a run that overflowed, retain model/optimizer moments but
+# reset the AMP scale and force the safer learning rate configured below.
+LOAD_SCALER_STATE_ON_RESUME = False
+OVERRIDE_RESUMED_LEARNING_RATE = True
+
+# Number of randomly selected full-resolution validation images in inference mode.
+NUM_RANDOM_INFERENCE_IMAGES = 5
+INFERENCE_OUTPUT_DIR = "./mst_bbdm_inference"
+
+# HSI/RGB file layout.
+HSI_KEY = "cube"
+SUPPORTED_HSI_EXTENSIONS = {".npy", ".npz", ".mat", ".pt", ".pth"}
+SUPPORTED_RGB_EXTENSIONS = {".png", ".jpg", ".jpeg", ".npy", ".pt", ".pth"}
+
+# This must match the normalization used to train MST++.
+# "none", "minmax", or "band_minmax".
+HSI_NORMALIZATION = "none"
+
+# Range used only when CLAMP_PREDICTION_FOR_METRICS=True.
+# The imported PSNR/SSIM functions retain their own definitions.
+METRIC_DATA_RANGE = 1.0
+CLAMP_PREDICTION_FOR_METRICS = False
+
+# Reverse-sampling options used for validation and inference.
+INFERENCE_CLIP_DENOISED = True
 INFERENCE_STOCHASTIC = False
-HEATMAP_REDUCTION = "mae"       # "mae" or "rmse"
 
-# Supported file extensions
-HSI_EXTENSIONS = {".mat", ".npy", ".npz", ".pt", ".pth"}
-RGB_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".npy", ".pt", ".pth"
-}
+# Residual Brownian-bridge architecture.
+HSI_CHANNELS = 31
+RGB_CHANNELS = 3
+RESIDUAL_N_FEAT = 31
+RESIDUAL_BODY_DEPTH = 3
+MST_DENOISER_STAGE = 2
+MST_DENOISER_NUM_BLOCKS = (1, 1, 1)
+NUM_DIFFUSION_STEPS = 50
+MIDPOINT_VARIANCE = 0.05
 
-# Fast corrupt-file filtering.
-VALIDATION_CACHE = Path(OUTPUT_DIR) / "hsi_validation_cache.pth"
-INVALID_FILE_LOG = Path(OUTPUT_DIR) / "invalid_hsi_files.txt"
-FORCE_REVALIDATE = False
+# The denoiser pads internally to 2 ** MST_DENOISER_STAGE.
+MODEL_DOWNSAMPLE_FACTOR = 2 ** MST_DENOISER_STAGE
 
-# ============================================================
-# General utilities
-# ============================================================
+# Training crops.
+TRAIN_CROP_SIZE = 256
+PATCHES_PER_IMAGE = 2
+
+# Training.
+BATCH_SIZE = 2
+VALIDATION_BATCH_SIZE = 2
+NUM_EPOCHS = 45
+LEARNING_RATE = 5e-5
+WEIGHT_DECAY = 1e-4
+MIN_LEARNING_RATE = 1e-7
+GRADIENT_CLIP_NORM = 1.0
+
+NUM_WORKERS = 4
+USE_AMP = True
+
+# Prefer BF16 when the GPU supports it. BF16 has a much wider exponent range
+# than FP16 and is substantially less likely to overflow during backprop.
+PREFER_BFLOAT16 = True
+
+# Used only when FP16 GradScaler is active.
+FP16_INITIAL_SCALE = 1024.0
+FP16_GROWTH_INTERVAL = 2000
+
+# A single overflow should not terminate a long run. The affected optimizer
+# step is skipped and the FP16 scale is reduced. Persistent overflows still
+# raise an error so real divergence is not hidden.
+MAX_CONSECUTIVE_NONFINITE_GRADIENTS = 10
+
+USE_AUGMENTATION = True
+SEED = 42
+PRINT_EVERY = 30
+
+# Main objective from the residual-prediction model.
+# The residual network predicts the clean correction residual directly.
+RESIDUAL_L1_WEIGHT = 1.0
+
+# Optional direct L1 loss on the refined HSI reconstruction.
+RECONSTRUCTION_L1_WEIGHT = 0.0
+
+# Actual RGB -> HSI reconstruction metrics require iterative diffusion sampling.
+# None evaluates every validation image. A positive integer limits cost.
+VALIDATION_METRIC_MAX_IMAGES: Optional[int] = 20
+
+# Training metrics use the single-step clean-residual estimate at the sampled t.
+COMPUTE_TRAIN_ONE_STEP_METRICS = True
+TRAIN_METRIC_EVERY = 1
+
+# Pseudo-RGB HSI bands used only for saved inference previews.
+# Change these indices for your wavelength ordering.
+VISUALIZATION_BANDS = (20, 10, 2)
+
+# ============================================================================
+# Reproducibility
+# ============================================================================
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -136,1669 +203,3271 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def get_device() -> torch.device:
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def seed_worker(worker_id: int) -> None:
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
 
-# ============================================================
-# File loading and pairing
-# ============================================================
+# ============================================================================
+# AMP helpers
+# ============================================================================
 
-def extract_cube(data: dict, path: Path) -> np.ndarray:
-    if HSI_KEY in data:
-        value = data[HSI_KEY]
+def get_amp_dtype(
+    device: torch.device,
+) -> torch.dtype:
+    if (
+        device.type == "cuda"
+        and PREFER_BFLOAT16
+        and torch.cuda.is_bf16_supported()
+    ):
+        return torch.bfloat16
+
+    return torch.float16
+
+
+def autocast_context(
+    device: torch.device,
+    enabled: bool,
+):
+    return torch.autocast(
+        device_type=device.type,
+        dtype=get_amp_dtype(device),
+        enabled=enabled,
+    )
+
+
+# ============================================================================
+# HSI/RGB loading
+# ============================================================================
+
+def _extract_3d_array_from_mapping(
+    data: dict,
+    file_path: Path,
+    preferred_key: Optional[str] = None,
+) -> np.ndarray:
+    if preferred_key is not None and preferred_key in data:
+        value = data[preferred_key]
         if isinstance(value, torch.Tensor):
             value = value.detach().cpu().numpy()
         if isinstance(value, np.ndarray) and value.ndim == 3:
             return value
 
-    candidates = []
+    candidates: List[np.ndarray] = []
+
     for key, value in data.items():
         if str(key).startswith("__"):
             continue
+
         if isinstance(value, torch.Tensor):
             value = value.detach().cpu().numpy()
-        if isinstance(value, np.ndarray) and value.ndim == 3:
+
+        if (
+            isinstance(value, np.ndarray)
+            and value.ndim == 3
+            and np.issubdtype(value.dtype, np.number)
+        ):
             candidates.append(value)
 
     if not candidates:
-        raise ValueError(f"No three-dimensional HSI cube found in {path}")
+        raise ValueError(
+            f"No numeric three-dimensional array was found in {file_path}."
+        )
+
     return max(candidates, key=lambda array: array.size)
 
 
-def load_hdf5_mat(path: Path) -> np.ndarray:
-    candidates = []
-    with h5py.File(str(path), "r") as file:
-        def visitor(_name, obj):
-            if isinstance(obj, h5py.Dataset) and obj.ndim == 3:
-                candidates.append(np.asarray(obj))
-        file.visititems(visitor)
+def load_mat_v73(
+    file_path: Path,
+    preferred_key: Optional[str] = None,
+) -> np.ndarray:
+    candidates: List[Tuple[str, np.ndarray]] = []
+
+    with h5py.File(str(file_path), "r") as h5_file:
+        if (
+            preferred_key is not None
+            and preferred_key in h5_file
+            and isinstance(h5_file[preferred_key], h5py.Dataset)
+            and h5_file[preferred_key].ndim == 3
+        ):
+            array = np.asarray(h5_file[preferred_key])
+            candidates.append((preferred_key, array))
+
+        if not candidates:
+            def visitor(name, obj):
+                if not isinstance(obj, h5py.Dataset):
+                    return
+                if obj.ndim != 3:
+                    return
+                try:
+                    if np.issubdtype(obj.dtype, np.number):
+                        candidates.append((name, np.asarray(obj)))
+                except TypeError:
+                    return
+
+            h5_file.visititems(visitor)
 
     if not candidates:
-        raise ValueError(f"No three-dimensional HSI cube found in {path}")
+        raise ValueError(
+            f"No numeric three-dimensional HSI dataset was found in {file_path}."
+        )
 
-    cube = max(candidates, key=lambda array: array.size)
-    # MATLAB v7.3 arrays read through h5py commonly have reversed axes.
-    return np.transpose(cube, tuple(range(cube.ndim - 1, -1, -1)))
+    _, cube = max(candidates, key=lambda item: item[1].size)
+
+    # MATLAB v7.3/HDF5 arrays are commonly stored with reversed dimensions.
+    # convert_to_chw() below performs the final spectral-axis identification.
+    cube = np.transpose(
+        cube,
+        axes=tuple(range(cube.ndim - 1, -1, -1)),
+    )
+    return cube
 
 
-def load_hsi(path: Path) -> np.ndarray:
-    extension = path.suffix.lower()
+def load_hsi_file(file_path: Path) -> np.ndarray:
+    extension = file_path.suffix.lower()
 
     if extension == ".npy":
-        cube = np.load(path)
+        cube = np.load(file_path)
+
     elif extension == ".npz":
-        loaded = np.load(path)
-        candidates = [loaded[key] for key in loaded.files if loaded[key].ndim == 3]
+        loaded = np.load(file_path)
+        candidates = [
+            loaded[key]
+            for key in loaded.files
+            if loaded[key].ndim == 3
+        ]
         if not candidates:
-            raise ValueError(f"No three-dimensional HSI cube found in {path}")
+            raise ValueError(
+                f"No three-dimensional array was found in {file_path}."
+            )
         cube = max(candidates, key=lambda array: array.size)
+
     elif extension == ".mat":
         try:
-            cube = extract_cube(sio.loadmat(path), path)
+            loaded = sio.loadmat(file_path)
+            cube = _extract_3d_array_from_mapping(
+                loaded,
+                file_path=file_path,
+                preferred_key=HSI_KEY,
+            )
         except (NotImplementedError, ValueError):
-            cube = load_hdf5_mat(path)
+            cube = load_mat_v73(
+                file_path=file_path,
+                preferred_key=HSI_KEY,
+            )
+
     elif extension in {".pt", ".pth"}:
-        loaded = torch.load(path, map_location="cpu")
+        try:
+            loaded = torch.load(
+                file_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+        except TypeError:
+            loaded = torch.load(
+                file_path,
+                map_location="cpu",
+            )
+
         if isinstance(loaded, torch.Tensor):
             cube = loaded.detach().cpu().numpy()
         elif isinstance(loaded, np.ndarray):
             cube = loaded
         elif isinstance(loaded, dict):
-            cube = extract_cube(loaded, path)
+            cube = _extract_3d_array_from_mapping(
+                loaded,
+                file_path=file_path,
+                preferred_key=HSI_KEY,
+            )
         else:
-            raise TypeError(f"Unsupported object in {path}: {type(loaded)}")
-    else:
-        raise ValueError(f"Unsupported HSI extension: {extension}")
+            raise TypeError(
+                f"Unsupported object type in {file_path}: {type(loaded)}"
+            )
 
-    cube = np.asarray(cube, dtype=np.float32).squeeze()
-    if cube.ndim != 3:
-        raise ValueError(f"Expected a 3D HSI cube in {path}, found {cube.shape}")
-
-    if cube.shape[0] == HSI_CHANNELS:
-        pass
-    elif cube.shape[-1] == HSI_CHANNELS:
-        cube = cube.transpose(2, 0, 1)
-    elif cube.shape[1] == HSI_CHANNELS:
-        cube = cube.transpose(1, 0, 2)
     else:
         raise ValueError(
-            f"Cannot identify the {HSI_CHANNELS}-band axis in {path}; shape={cube.shape}"
+            f"Unsupported HSI extension: {extension}"
         )
 
-    if not np.isfinite(cube).all():
-        raise ValueError(f"NaN or Inf values found in {path}")
+    cube = np.asarray(cube, dtype=np.float32)
+    cube = np.squeeze(cube)
 
-    return np.ascontiguousarray(cube)
+    if cube.ndim != 3:
+        raise ValueError(
+            f"Expected a three-dimensional HSI cube in {file_path}, "
+            f"but found shape {cube.shape}."
+        )
+
+    return cube
 
 
-def load_rgb(path: Path) -> np.ndarray:
-    extension = path.suffix.lower()
+def convert_hsi_to_chw(
+    cube: np.ndarray,
+    hsi_channels: int,
+    file_path: Path,
+) -> np.ndarray:
+    if cube.shape[0] == hsi_channels:
+        return np.ascontiguousarray(cube)
 
-    if extension in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}:
-        image = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
-        return np.ascontiguousarray(image.transpose(2, 0, 1))
+    if cube.shape[-1] == hsi_channels:
+        return np.ascontiguousarray(
+            np.transpose(cube, (2, 0, 1))
+        )
+
+    if cube.shape[1] == hsi_channels:
+        return np.ascontiguousarray(
+            np.transpose(cube, (1, 0, 2))
+        )
+
+    raise ValueError(
+        f"Could not identify the spectral axis in {file_path}. "
+        f"Found shape {cube.shape}; expected {hsi_channels} bands."
+    )
+
+
+def load_rgb_file(file_path: Path) -> np.ndarray:
+    extension = file_path.suffix.lower()
+
+    if extension in {".png", ".jpg", ".jpeg"}:
+        image = Image.open(file_path).convert("RGB")
+        array = np.asarray(image, dtype=np.float32) / 255.0
+        return np.ascontiguousarray(
+            np.transpose(array, (2, 0, 1))
+        )
 
     if extension == ".npy":
-        image = np.load(path)
+        array = np.load(file_path).astype(np.float32)
+
     elif extension in {".pt", ".pth"}:
-        loaded = torch.load(path, map_location="cpu")
-        if not isinstance(loaded, torch.Tensor):
-            raise TypeError(f"Expected a tensor in RGB file {path}")
-        image = loaded.detach().cpu().numpy()
+        try:
+            loaded = torch.load(
+                file_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+        except TypeError:
+            loaded = torch.load(
+                file_path,
+                map_location="cpu",
+            )
+
+        if isinstance(loaded, torch.Tensor):
+            array = loaded.detach().cpu().float().numpy()
+        elif isinstance(loaded, np.ndarray):
+            array = loaded.astype(np.float32)
+        else:
+            raise TypeError(
+                f"Unsupported RGB object in {file_path}: {type(loaded)}"
+            )
+
     else:
-        raise ValueError(f"Unsupported RGB extension: {extension}")
-
-    image = np.asarray(image, dtype=np.float32).squeeze()
-    if image.ndim != 3:
-        raise ValueError(f"Expected a 3D RGB image in {path}, found {image.shape}")
-
-    if image.shape[0] == 3:
-        pass
-    elif image.shape[-1] == 3:
-        image = image.transpose(2, 0, 1)
-    else:
-        raise ValueError(f"Cannot identify RGB channels in {path}; shape={image.shape}")
-
-    if image.max() > 1.0:
-        image = image / 255.0
-    return np.ascontiguousarray(image)
-
-
-def normalize_hsi(cube: np.ndarray) -> np.ndarray:
-    if NORMALIZATION == "none":
-        return cube
-    if NORMALIZATION == "minmax":
-        minimum = cube.min()
-        maximum = cube.max()
-        return (cube - minimum) / (maximum - minimum + 1e-8)
-    raise ValueError(f"Unknown NORMALIZATION value: {NORMALIZATION}")
-
-
-def build_pairs() -> List[Tuple[Path, Path]]:
-    hsi_root = Path(HSI_DATA_DIR)
-    rgb_root = Path(RGB_DATA_DIR)
-
-    if not hsi_root.exists():
-        raise FileNotFoundError(f"HSI_DATA_DIR does not exist: {hsi_root}")
-    if not rgb_root.exists():
-        raise FileNotFoundError(f"RGB_DATA_DIR does not exist: {rgb_root}")
-
-    rgb_by_stem = {
-        path.stem: path
-        for path in rgb_root.rglob("*")
-        if path.is_file() and path.suffix.lower() in RGB_EXTENSIONS
-    }
-
-    pairs = []
-    for hsi_path in sorted(hsi_root.rglob("*")):
-        if hsi_path.is_file() and hsi_path.suffix.lower() in HSI_EXTENSIONS:
-            rgb_path = rgb_by_stem.get(hsi_path.stem)
-            if rgb_path is not None:
-                pairs.append((hsi_path, rgb_path))
-
-    if not pairs:
-        raise RuntimeError(
-            "No paired files found. RGB and HSI files must have matching filename stems."
+        raise ValueError(
+            f"Unsupported RGB extension: {extension}"
         )
 
+    array = np.squeeze(array)
+
+    if array.ndim == 2:
+        array = np.stack([array, array, array], axis=0)
+    elif array.ndim == 3 and array.shape[0] == 3:
+        pass
+    elif array.ndim == 3 and array.shape[-1] == 3:
+        array = np.transpose(array, (2, 0, 1))
+    else:
+        raise ValueError(
+            f"Could not convert RGB file {file_path} to CHW. "
+            f"Found shape {array.shape}."
+        )
+
+    array = np.asarray(array, dtype=np.float32)
+
+    # Normalize common uint-like NPY/PT representations.
+    if np.nanmax(array) > 1.5:
+        array = array / 255.0
+
+    return np.ascontiguousarray(array)
+
+
+def normalize_hsi_cube(
+    cube: np.ndarray,
+    mode: str,
+) -> np.ndarray:
+    if mode == "none":
+        return cube
+
+    if mode == "minmax":
+        minimum = float(cube.min())
+        maximum = float(cube.max())
+        return (
+            (cube - minimum)
+            / (maximum - minimum + 1e-8)
+        )
+
+    if mode == "band_minmax":
+        minimum = cube.min(
+            axis=(1, 2),
+            keepdims=True,
+        )
+        maximum = cube.max(
+            axis=(1, 2),
+            keepdims=True,
+        )
+        return (
+            (cube - minimum)
+            / (maximum - minimum + 1e-8)
+        )
+
+    raise ValueError(
+        f"Unknown HSI normalization mode: {mode}"
+    )
+
+
+# ============================================================================
+# File discovery, pairing, and validation
+# ============================================================================
+
+def find_files(
+    directory: str,
+    extensions: Sequence[str],
+    kind: str,
+) -> List[Path]:
+    root = Path(directory)
+
+    if not root.exists():
+        raise FileNotFoundError(
+            f"{kind} directory does not exist: {root}"
+        )
+
+    files = sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and path.suffix.lower() in extensions
+    )
+
+    if not files:
+        raise RuntimeError(
+            f"No supported {kind} files were found in {root}."
+        )
+
+    return files
+
+
+def _index_unique_stems(
+    files: Sequence[Path],
+    kind: str,
+) -> Dict[str, Path]:
+    index: Dict[str, Path] = {}
+
+    for path in files:
+        if path.stem in index:
+            raise RuntimeError(
+                f"Duplicate {kind} filename stem '{path.stem}'.\n"
+                f"First:  {index[path.stem]}\n"
+                f"Second: {path}"
+            )
+        index[path.stem] = path
+
+    return index
+
+
+def pair_hsi_rgb_files(
+    hsi_directory: str,
+    rgb_directory: str,
+) -> List[Tuple[Path, Path]]:
+    hsi_files = find_files(
+        hsi_directory,
+        SUPPORTED_HSI_EXTENSIONS,
+        "HSI",
+    )
+    rgb_files = find_files(
+        rgb_directory,
+        SUPPORTED_RGB_EXTENSIONS,
+        "RGB",
+    )
+
+    hsi_by_stem = _index_unique_stems(
+        hsi_files,
+        "HSI",
+    )
+    rgb_by_stem = _index_unique_stems(
+        rgb_files,
+        "RGB",
+    )
+
+    shared_stems = sorted(
+        set(hsi_by_stem) & set(rgb_by_stem)
+    )
+
+    missing_rgb = sorted(
+        set(hsi_by_stem) - set(rgb_by_stem)
+    )
+    missing_hsi = sorted(
+        set(rgb_by_stem) - set(hsi_by_stem)
+    )
+
+    if missing_rgb:
+        print(
+            f"Warning: {len(missing_rgb)} HSI files have no matching RGB file."
+        )
+    if missing_hsi:
+        print(
+            f"Warning: {len(missing_hsi)} RGB files have no matching HSI file."
+        )
+
+    if not shared_stems:
+        raise RuntimeError(
+            "No paired HSI/RGB files were found. "
+            "The paired files must have identical filename stems."
+        )
+
+    pairs = [
+        (
+            hsi_by_stem[stem],
+            rgb_by_stem[stem],
+        )
+        for stem in shared_stems
+    ]
+
+    print(
+        f"Found {len(pairs)} paired files in:\n"
+        f"  HSI: {hsi_directory}\n"
+        f"  RGB: {rgb_directory}"
+    )
     return pairs
 
 
-# ============================================================
-# Fast HSI validation and cache
-# ============================================================
+def make_files_fingerprint(
+    files: Sequence[Path],
+) -> str:
+    """
+    Create a cache fingerprint from file path, size, and modification time.
 
-def is_possible_hsi_shape(shape: Tuple[int, ...]) -> bool:
+    The cache is invalidated automatically if an HSI file is added, removed,
+    replaced, or modified.
+    """
+    records = []
+
+    for file_path in files:
+        stat = file_path.stat()
+        records.append(
+            f"{file_path.resolve()}|"
+            f"{stat.st_size}|"
+            f"{stat.st_mtime_ns}"
+        )
+
+    return hashlib.sha256(
+        "\n".join(records).encode("utf-8")
+    ).hexdigest()
+
+
+def is_possible_hsi_shape(
+    shape: Sequence[int],
+    hsi_channels: int,
+) -> bool:
     return (
         len(shape) == 3
-        and HSI_CHANNELS in shape
+        and hsi_channels in shape
         and all(int(size) > 0 for size in shape)
     )
 
 
-def inspect_hdf5_mat(path: Path) -> None:
-    """Inspect only HDF5 metadata; opening also detects truncated v7.3 files."""
-    candidates: List[Tuple[str, Tuple[int, ...]]] = []
+def inspect_hdf5_mat_file(
+    file_path: Path,
+    hsi_channels: int,
+    hsi_key: str,
+) -> None:
+    """
+    Inspect a MATLAB v7.3/HDF5 file without loading its full HSI cube.
+    """
+    candidates: List[
+        Tuple[str, Tuple[int, ...]]
+    ] = []
 
-    with h5py.File(str(path), "r") as file:
-        if HSI_KEY in file and isinstance(file[HSI_KEY], h5py.Dataset):
-            dataset = file[HSI_KEY]
-            candidates.append((HSI_KEY, tuple(int(v) for v in dataset.shape)))
+    with h5py.File(
+        str(file_path),
+        "r",
+    ) as h5_file:
+        if (
+            hsi_key in h5_file
+            and isinstance(
+                h5_file[hsi_key],
+                h5py.Dataset,
+            )
+        ):
+            dataset = h5_file[hsi_key]
+            candidates.append(
+                (
+                    hsi_key,
+                    tuple(
+                        int(value)
+                        for value in dataset.shape
+                    ),
+                )
+            )
+        else:
+            def visitor(name, obj):
+                if (
+                    not isinstance(obj, h5py.Dataset)
+                    or obj.ndim != 3
+                ):
+                    return
 
-        def visitor(name, obj):
-            if not isinstance(obj, h5py.Dataset) or obj.ndim != 3:
-                return
-            try:
-                if np.issubdtype(obj.dtype, np.number):
-                    record = (name, tuple(int(v) for v in obj.shape))
-                    if record not in candidates:
-                        candidates.append(record)
-            except TypeError:
-                return
+                try:
+                    if np.issubdtype(
+                        obj.dtype,
+                        np.number,
+                    ):
+                        candidates.append(
+                            (
+                                name,
+                                tuple(
+                                    int(value)
+                                    for value in obj.shape
+                                ),
+                            )
+                        )
+                except TypeError:
+                    return
 
-        file.visititems(visitor)
+            h5_file.visititems(visitor)
 
     if not candidates:
-        raise ValueError(f"No numerical 3D HDF5 dataset found in {path}")
-
-    if not any(is_possible_hsi_shape(shape) for _, shape in candidates):
         raise ValueError(
-            f"No {HSI_CHANNELS}-band cube found in {path}; "
-            f"HDF5 datasets={candidates}"
+            f"No numerical three-dimensional dataset "
+            f"was found in {file_path}."
+        )
+
+    if not any(
+        is_possible_hsi_shape(
+            shape,
+            hsi_channels,
+        )
+        for _, shape in candidates
+    ):
+        raise ValueError(
+            f"No {hsi_channels}-band cube was found in "
+            f"{file_path}. HDF5 datasets: {candidates}"
         )
 
 
-def inspect_standard_mat(path: Path) -> None:
-    """Read the MAT directory only; do not load the full cube."""
+def inspect_standard_mat_file(
+    file_path: Path,
+    hsi_channels: int,
+    hsi_key: str,
+) -> None:
+    """
+    Inspect a standard MATLAB file using scipy.io.whosmat(), which reads
+    array metadata rather than loading every array.
+    """
     try:
-        metadata = sio.whosmat(path)
-    except (NotImplementedError, ValueError, OSError):
-        # MATLAB v7.3 uses HDF5. h5py.File will also expose truncation errors.
-        inspect_hdf5_mat(path)
+        metadata = sio.whosmat(file_path)
+    except (
+        NotImplementedError,
+        ValueError,
+        OSError,
+    ):
+        # MATLAB v7.3 files require HDF5 inspection.
+        inspect_hdf5_mat_file(
+            file_path=file_path,
+            hsi_channels=hsi_channels,
+            hsi_key=hsi_key,
+        )
         return
 
     candidates = [
-        (name, tuple(int(v) for v in shape))
-        for name, shape, _dtype in metadata
+        (
+            name,
+            tuple(
+                int(value)
+                for value in shape
+            ),
+        )
+        for name, shape, _ in metadata
         if len(shape) == 3
     ]
 
     if not candidates:
-        raise ValueError(f"No 3D array found in {path}")
-
-    preferred = [item for item in candidates if item[0] == HSI_KEY]
-    shapes_to_check = preferred if preferred else candidates
-    if not any(is_possible_hsi_shape(shape) for _, shape in shapes_to_check):
         raise ValueError(
-            f"No {HSI_CHANNELS}-band cube found in {path}; MAT arrays={candidates}"
+            f"No three-dimensional array was found in "
+            f"{file_path}."
+        )
+
+    preferred = [
+        candidate
+        for candidate in candidates
+        if candidate[0] == hsi_key
+    ]
+    arrays_to_check = (
+        preferred
+        if preferred
+        else candidates
+    )
+
+    if not any(
+        is_possible_hsi_shape(
+            shape,
+            hsi_channels,
+        )
+        for _, shape in arrays_to_check
+    ):
+        raise ValueError(
+            f"No {hsi_channels}-band cube was found in "
+            f"{file_path}. MATLAB arrays: {candidates}"
         )
 
 
-def inspect_hsi_metadata(path: Path) -> None:
-    """Validate shape/readability with the cheapest available operation."""
-    extension = path.suffix.lower()
+def inspect_hsi_file_metadata(
+    file_path: Path,
+    hsi_channels: int,
+    hsi_key: str,
+) -> None:
+    """
+    Validate an HSI file in the same way as the earlier training script.
 
-    if extension == ".mat":
-        inspect_standard_mat(path)
+    .mat:
+        Inspect metadata only with whosmat() or an HDF5 header.
+
+    .npy/.npz/.pt/.pth:
+        Reuse the normal loader because these formats are comparatively
+        inexpensive to inspect.
+    """
+    if file_path.suffix.lower() == ".mat":
+        inspect_standard_mat_file(
+            file_path=file_path,
+            hsi_channels=hsi_channels,
+            hsi_key=hsi_key,
+        )
         return
 
-    if extension == ".npy":
-        array = np.load(path, mmap_mode="r", allow_pickle=False)
-        if not is_possible_hsi_shape(tuple(int(v) for v in array.shape)):
-            raise ValueError(f"Invalid HSI shape {array.shape} in {path}")
-        return
+    cube = load_hsi_file(file_path)
 
-    if extension == ".npz":
-        with np.load(path, allow_pickle=False) as archive:
-            shapes = [
-                tuple(int(v) for v in archive[key].shape)
-                for key in archive.files
-                if archive[key].ndim == 3
-            ]
-        if not any(is_possible_hsi_shape(shape) for shape in shapes):
-            raise ValueError(f"No valid {HSI_CHANNELS}-band cube in {path}; shapes={shapes}")
-        return
-
-    # Tensor checkpoints cannot be inspected reliably without loading the object.
-    cube = load_hsi(path)
-    if not is_possible_hsi_shape(tuple(int(v) for v in cube.shape)):
-        raise ValueError(f"Invalid HSI shape {cube.shape} in {path}")
-
-
-def make_pairs_fingerprint(pairs: List[Tuple[Path, Path]]) -> str:
-    records = []
-    for hsi_path, rgb_path in pairs:
-        for path in (hsi_path, rgb_path):
-            stat = path.stat()
-            records.append(
-                f"{path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
-            )
-    return hashlib.sha256("\n".join(records).encode("utf-8")).hexdigest()
-
-
-def load_validation_cache(path: Path) -> dict:
-    try:
-        return torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:
-        # Compatibility with older PyTorch versions without weights_only.
-        return torch.load(path, map_location="cpu")
+    if not is_possible_hsi_shape(
+        cube.shape,
+        hsi_channels,
+    ):
+        raise ValueError(
+            f"Invalid HSI shape {cube.shape} in "
+            f"{file_path}."
+        )
 
 
 def filter_valid_pairs(
-    pairs: List[Tuple[Path, Path]],
+    pairs: Sequence[Tuple[Path, Path]],
+    hsi_channels: int,
+    log_path: Path,
+    cache_path: Path,
 ) -> List[Tuple[Path, Path]]:
-    """Skip unreadable HSI files before DataLoader workers are created."""
-    VALIDATION_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    INVALID_FILE_LOG.parent.mkdir(parents=True, exist_ok=True)
+    """
+    Metadata-first HSI validation with a persistent cache.
 
-    fingerprint = make_pairs_fingerprint(pairs)
-    pair_lookup = {str(hsi.resolve()): (hsi, rgb) for hsi, rgb in pairs}
+    This mirrors the checking approach in the earlier script:
+      1. Pair files by filename stem.
+      2. Check MATLAB files through metadata rather than loading full cubes.
+      3. Cache valid/invalid results using a file fingerprint.
+      4. Skip invalid HSI files and write their errors to a log.
 
-    if VALIDATION_CACHE.exists() and not FORCE_REVALIDATE:
+    RGB files have already been checked for a supported extension during
+    pairing. Their full pixel data is loaded only by the Dataset.
+    """
+    cache_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    log_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    pairs = list(pairs)
+    hsi_files = [
+        hsi_path
+        for hsi_path, _ in pairs
+    ]
+
+    fingerprint = make_files_fingerprint(
+        hsi_files
+    )
+
+    pair_lookup = {
+        str(hsi_path.resolve()): (
+            hsi_path,
+            rgb_path,
+        )
+        for hsi_path, rgb_path in pairs
+    }
+
+    # ------------------------------------------------------------------
+    # Reuse an unchanged validation cache.
+    # ------------------------------------------------------------------
+    if cache_path.exists():
         try:
-            cached = load_validation_cache(VALIDATION_CACHE)
-            if isinstance(cached, dict) and cached.get("fingerprint") == fingerprint:
+            try:
+                cached = torch.load(
+                    cache_path,
+                    map_location="cpu",
+                    weights_only=False,
+                )
+            except TypeError:
+                cached = torch.load(
+                    cache_path,
+                    map_location="cpu",
+                )
+
+            if (
+                isinstance(cached, dict)
+                and cached.get("fingerprint")
+                == fingerprint
+            ):
+                valid_paths = cached.get(
+                    "valid_hsi_paths",
+                    [],
+                )
+                invalid_records = cached.get(
+                    "invalid_records",
+                    [],
+                )
+
                 valid_pairs = [
                     pair_lookup[path]
-                    for path in cached.get("valid_hsi_paths", [])
+                    for path in valid_paths
                     if path in pair_lookup
                 ]
-                invalid_records = cached.get("invalid_records", [])
+
+                print(
+                    f"\nUsing cached pair validation: "
+                    f"{cache_path}"
+                )
+                print(
+                    f"Valid pairs:   {len(valid_pairs)}"
+                )
+                print(
+                    f"Invalid files: "
+                    f"{len(invalid_records)}"
+                )
+
+                for record in invalid_records:
+                    print(
+                        "\nCached invalid file:\n"
+                        f"  File:  {record['path']}\n"
+                        f"  Error: {record['error']}"
+                    )
 
                 if valid_pairs:
-                    print("Using cached HSI validation.")
-                    print(f"Valid pairs: {len(valid_pairs)}")
-                    print(f"Skipped corrupt/invalid files: {len(invalid_records)}")
-                    for record in invalid_records[:10]:
-                        print(f"  Skipped: {record['path']} | {record['error']}")
                     return valid_pairs
+
         except Exception as error:
-            print(f"Validation cache could not be used; rescanning. Reason: {error}")
+            print(
+                "\nCould not use the validation cache. "
+                "The dataset will be checked again.\n"
+                f"Reason: {error}"
+            )
 
-    print(f"Checking {len(pairs)} HSI files using metadata only...")
-    valid_pairs: List[Tuple[Path, Path]] = []
-    invalid_records = []
+    # ------------------------------------------------------------------
+    # Perform a fresh metadata-first scan.
+    # ------------------------------------------------------------------
+    print(
+        "\nChecking HSI file metadata before use..."
+    )
 
-    for index, (hsi_path, rgb_path) in enumerate(pairs, start=1):
+    valid_pairs: List[
+        Tuple[Path, Path]
+    ] = []
+    invalid_records: List[dict] = []
+
+    for index, (
+        hsi_path,
+        rgb_path,
+    ) in enumerate(
+        pairs,
+        start=1,
+    ):
         try:
-            inspect_hsi_metadata(hsi_path)
-            valid_pairs.append((hsi_path, rgb_path))
+            inspect_hsi_file_metadata(
+                file_path=hsi_path,
+                hsi_channels=hsi_channels,
+                hsi_key=HSI_KEY,
+            )
+            valid_pairs.append(
+                (hsi_path, rgb_path)
+            )
+
         except Exception as error:
             invalid_records.append(
                 {
-                    "path": str(hsi_path.resolve()),
-                    "error": f"{type(error).__name__}: {error}",
+                    "path": str(
+                        hsi_path.resolve()
+                    ),
+                    "error": (
+                        f"{type(error).__name__}: "
+                        f"{error}"
+                    ),
                 }
             )
-            print(f"  Skipping invalid HSI: {hsi_path.name} | {error}")
 
-        if index % 100 == 0 or index == len(pairs):
             print(
-                f"  Checked {index}/{len(pairs)} | "
-                f"valid={len(valid_pairs)} | invalid={len(invalid_records)}"
+                "\nSkipping invalid HSI file:\n"
+                f"  File:  {hsi_path}\n"
+                f"  Error: {error}"
+            )
+
+        if (
+            index % 100 == 0
+            or index == len(pairs)
+        ):
+            print(
+                f"Checked {index}/{len(pairs)} | "
+                f"Valid: {len(valid_pairs)} | "
+                f"Invalid: {len(invalid_records)}"
             )
 
     if not valid_pairs:
-        raise RuntimeError("No valid HSI/RGB pairs remain after validation")
+        raise RuntimeError(
+            "No valid HSI/RGB pairs remain after "
+            "metadata validation."
+        )
 
     if invalid_records:
-        with INVALID_FILE_LOG.open("w", encoding="utf-8") as file:
+        with log_path.open(
+            "w",
+            encoding="utf-8",
+        ) as log_file:
             for record in invalid_records:
-                file.write(f"{record['path']} | {record['error']}\n")
-        print(f"Invalid-file log saved to: {INVALID_FILE_LOG}")
-    elif INVALID_FILE_LOG.exists():
-        INVALID_FILE_LOG.unlink()
+                log_file.write(
+                    f"{record['path']} | "
+                    f"{record['error']}\n"
+                )
+
+        print(
+            f"\nInvalid-file log saved to: "
+            f"{log_path}"
+        )
 
     torch.save(
         {
             "fingerprint": fingerprint,
-            "valid_hsi_paths": [str(hsi.resolve()) for hsi, _ in valid_pairs],
+            "valid_hsi_paths": [
+                str(hsi_path.resolve())
+                for hsi_path, _ in valid_pairs
+            ],
             "invalid_records": invalid_records,
         },
-        VALIDATION_CACHE,
+        cache_path,
     )
-    print(f"Validation cache saved to: {VALIDATION_CACHE}")
+
+    print(
+        f"Validation cache saved to: "
+        f"{cache_path}"
+    )
+
     return valid_pairs
 
 
-# ============================================================
-# Dataset
-# ============================================================
+# ============================================================================
+# Paired spatial transforms
+# ============================================================================
+
+def _pad_tensor_to_minimum_size(
+    tensor: torch.Tensor,
+    minimum_height: int,
+    minimum_width: int,
+) -> torch.Tensor:
+    _, height, width = tensor.shape
+
+    pad_height = max(
+        0,
+        minimum_height - height,
+    )
+    pad_width = max(
+        0,
+        minimum_width - width,
+    )
+
+    if pad_height == 0 and pad_width == 0:
+        return tensor
+
+    return F.pad(
+        tensor,
+        (0, pad_width, 0, pad_height),
+        mode="replicate",
+    )
+
+
+def random_crop_pair(
+    hsi: torch.Tensor,
+    rgb: torch.Tensor,
+    crop_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    hsi = _pad_tensor_to_minimum_size(
+        hsi,
+        crop_size,
+        crop_size,
+    )
+    rgb = _pad_tensor_to_minimum_size(
+        rgb,
+        crop_size,
+        crop_size,
+    )
+
+    _, height, width = hsi.shape
+
+    top = random.randint(
+        0,
+        height - crop_size,
+    )
+    left = random.randint(
+        0,
+        width - crop_size,
+    )
+
+    return (
+        hsi[
+            :,
+            top:top + crop_size,
+            left:left + crop_size,
+        ],
+        rgb[
+            :,
+            top:top + crop_size,
+            left:left + crop_size,
+        ],
+    )
+
+
+def center_crop_pair(
+    hsi: torch.Tensor,
+    rgb: torch.Tensor,
+    crop_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    hsi = _pad_tensor_to_minimum_size(
+        hsi,
+        crop_size,
+        crop_size,
+    )
+    rgb = _pad_tensor_to_minimum_size(
+        rgb,
+        crop_size,
+        crop_size,
+    )
+
+    _, height, width = hsi.shape
+
+    top = (height - crop_size) // 2
+    left = (width - crop_size) // 2
+
+    return (
+        hsi[
+            :,
+            top:top + crop_size,
+            left:left + crop_size,
+        ],
+        rgb[
+            :,
+            top:top + crop_size,
+            left:left + crop_size,
+        ],
+    )
+
 
 def augment_pair(
-    rgb: torch.Tensor,
     hsi: torch.Tensor,
+    rgb: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if random.random() < 0.5:
-        rgb = torch.flip(rgb, dims=[1])
         hsi = torch.flip(hsi, dims=[1])
+        rgb = torch.flip(rgb, dims=[1])
+
     if random.random() < 0.5:
-        rgb = torch.flip(rgb, dims=[2])
         hsi = torch.flip(hsi, dims=[2])
+        rgb = torch.flip(rgb, dims=[2])
 
     rotations = random.randint(0, 3)
     if rotations:
-        rgb = torch.rot90(rgb, rotations, dims=[1, 2])
-        hsi = torch.rot90(hsi, rotations, dims=[1, 2])
+        hsi = torch.rot90(
+            hsi,
+            k=rotations,
+            dims=(1, 2),
+        )
+        rgb = torch.rot90(
+            rgb,
+            k=rotations,
+            dims=(1, 2),
+        )
 
-    return rgb.contiguous(), hsi.contiguous()
+    return hsi.contiguous(), rgb.contiguous()
 
 
-class RGBHSIDataset(Dataset):
-    def __init__(self, pairs: List[Tuple[Path, Path]], training: bool):
-        self.pairs = pairs
+def pad_pair_to_multiple(
+    hsi: torch.Tensor,
+    rgb: torch.Tensor,
+    multiple: int,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    int,
+]:
+    _, original_height, original_width = hsi.shape
+
+    pad_height = (
+        multiple - original_height % multiple
+    ) % multiple
+    pad_width = (
+        multiple - original_width % multiple
+    ) % multiple
+
+    if pad_height == 0 and pad_width == 0:
+        return (
+            hsi,
+            rgb,
+            original_height,
+            original_width,
+        )
+
+    hsi = F.pad(
+        hsi,
+        (0, pad_width, 0, pad_height),
+        mode="replicate",
+    )
+    rgb = F.pad(
+        rgb,
+        (0, pad_width, 0, pad_height),
+        mode="replicate",
+    )
+
+    return (
+        hsi,
+        rgb,
+        original_height,
+        original_width,
+    )
+
+
+# ============================================================================
+# Dataset
+# ============================================================================
+
+class HSIRGBPairDataset(Dataset):
+    def __init__(
+        self,
+        pairs: Sequence[Tuple[Path, Path]],
+        hsi_channels: int,
+        crop_size: Optional[int],
+        patches_per_image: int,
+        training: bool,
+        normalization: str,
+        augment: bool,
+        return_paths: bool = False,
+    ):
+        self.pairs = list(pairs)
+        self.hsi_channels = hsi_channels
+        self.crop_size = crop_size
+        self.patches_per_image = patches_per_image
         self.training = training
+        self.normalization = normalization
+        self.augment = augment
+        self.return_paths = return_paths
+
+        if training and crop_size is None:
+            raise ValueError(
+                "Training requires a finite crop_size."
+            )
 
     def __len__(self) -> int:
-        return len(self.pairs)
-
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        hsi_path, rgb_path = self.pairs[index]
-
-        rgb = torch.from_numpy(load_rgb(rgb_path)).float()
-        hsi = torch.from_numpy(normalize_hsi(load_hsi(hsi_path))).float()
-
-        if rgb.shape[1:] != hsi.shape[1:]:
-            raise ValueError(
-                f"Spatial mismatch for {hsi_path.stem}: RGB={rgb.shape}, HSI={hsi.shape}"
-            )
-
-        # No crop or resize: use the complete RGB/HSI pair.
-        # MST++ pads internally to a multiple of 8 and crops its output back
-        # to the original height and width.
-        if self.training and USE_AUGMENTATION:
-            rgb, hsi = augment_pair(rgb, hsi)
-
-        return rgb, hsi
-
-
-# ============================================================
-# Losses, metrics, and residual heatmap
-# ============================================================
-
-def unwrap_prediction(output: torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, ...]) -> torch.Tensor:
-    """Return the final reconstruction if a model returns intermediate outputs."""
-    if isinstance(output, (list, tuple)):
-        if not output:
-            raise ValueError("The model returned an empty output sequence")
-        output = output[-1]
-    if not isinstance(output, torch.Tensor):
-        raise TypeError(f"Expected model output to be a tensor, found {type(output)}")
-    return output
-
-
-def check_prediction_target_shapes(
-    prediction: torch.Tensor,
-    target: torch.Tensor,
-) -> None:
-    if prediction.shape != target.shape:
-        raise ValueError(
-            "Prediction and target must have identical BCHW shapes; "
-            f"prediction={tuple(prediction.shape)}, target={tuple(target.shape)}"
+        multiplier = (
+            self.patches_per_image
+            if self.training
+            else 1
         )
-    if prediction.ndim != 4:
-        raise ValueError(
-            f"Expected BCHW prediction and target tensors, found {prediction.ndim} dimensions"
-        )
+        return len(self.pairs) * multiplier
 
-
-def stable_mrae_per_sample(
-    prediction: torch.Tensor,
-    target: torch.Tensor,
-) -> torch.Tensor:
-    """MRAE per image, computed in float32 with a non-underflowing denominator."""
-    prediction = prediction.float()
-    target = target.float()
-    denominator = target.abs().clamp_min(MRAE_EPSILON)
-    return ((prediction - target).abs() / denominator).mean(dim=(1, 2, 3))
-
-
-def reconstruction_loss(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Stable optimization loss; always evaluated outside mixed precision."""
-    check_prediction_target_shapes(prediction, target)
-    with torch.amp.autocast(device_type=prediction.device.type, enabled=False):
-        return stable_mrae_per_sample(prediction, target).mean()
-
-
-def _gaussian_kernel(
-    channels: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    window_size = min(SSIM_WINDOW_SIZE, 11)
-    if window_size % 2 == 0:
-        window_size -= 1
-    coordinates = torch.arange(window_size, device=device, dtype=dtype)
-    coordinates = coordinates - (window_size - 1) / 2
-    gaussian = torch.exp(-(coordinates.square()) / (2 * SSIM_SIGMA * SSIM_SIGMA))
-    gaussian = gaussian / gaussian.sum()
-    kernel_2d = torch.outer(gaussian, gaussian)
-    return kernel_2d.view(1, 1, window_size, window_size).expand(
-        channels, 1, window_size, window_size
-    ).contiguous()
-
-
-def _ssim_filter(image: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
-    padding = kernel.shape[-1] // 2
-    height, width = image.shape[-2:]
-    padding_mode = "reflect" if height > padding and width > padding else "replicate"
-    image = F.pad(image, (padding, padding, padding, padding), mode=padding_mode)
-    return F.conv2d(image, kernel, groups=image.shape[1])
-
-
-def ssim_per_sample(
-    prediction: torch.Tensor,
-    target: torch.Tensor,
-) -> torch.Tensor:
-    """Windowed SSIM averaged over all spectral bands and spatial positions."""
-    channels = prediction.shape[1]
-    kernel = _gaussian_kernel(channels, prediction.device, prediction.dtype)
-
-    mu_prediction = _ssim_filter(prediction, kernel)
-    mu_target = _ssim_filter(target, kernel)
-
-    mu_prediction_sq = mu_prediction.square()
-    mu_target_sq = mu_target.square()
-    mu_cross = mu_prediction * mu_target
-
-    sigma_prediction_sq = (
-        _ssim_filter(prediction.square(), kernel) - mu_prediction_sq
-    ).clamp_min(0.0)
-    sigma_target_sq = (
-        _ssim_filter(target.square(), kernel) - mu_target_sq
-    ).clamp_min(0.0)
-    sigma_cross = _ssim_filter(prediction * target, kernel) - mu_cross
-
-    c1 = (0.01 * METRIC_DATA_RANGE) ** 2
-    c2 = (0.03 * METRIC_DATA_RANGE) ** 2
-    numerator = (2.0 * mu_cross + c1) * (2.0 * sigma_cross + c2)
-    denominator = (
-        (mu_prediction_sq + mu_target_sq + c1)
-        * (sigma_prediction_sq + sigma_target_sq + c2)
-    ).clamp_min(1e-12)
-
-    return (numerator / denominator).mean(dim=(1, 2, 3))
-
-
-@torch.no_grad()
-def calculate_metric_tensors(
-    prediction: torch.Tensor,
-    target: torch.Tensor,
-) -> Dict[str, torch.Tensor]:
-    """Return one value per image for every metric."""
-    check_prediction_target_shapes(prediction, target)
-
-    prediction = prediction.detach().float()
-    target = target.detach().float()
-    error = prediction - target
-    mse = error.square().mean(dim=(1, 2, 3))
-
-    mrae_values = stable_mrae_per_sample(prediction, target)
-    rmse_values = mse.sqrt()
-    psnr_values = 10.0 * torch.log10(
-        (METRIC_DATA_RANGE ** 2) / mse.clamp_min(1e-12)
-    )
-
-    dot_product = (prediction * target).sum(dim=1)
-    prediction_norm = prediction.square().sum(dim=1).sqrt()
-    target_norm = target.square().sum(dim=1).sqrt()
-    norm_product = prediction_norm * target_norm
-    valid_pixels = norm_product > SAM_EPSILON
-
-    cosine = dot_product / norm_product.clamp_min(SAM_EPSILON)
-    angle = torch.acos(cosine.clamp(-1.0, 1.0))
-    angle = torch.where(valid_pixels, angle, torch.zeros_like(angle))
-    valid_count = valid_pixels.sum(dim=(1, 2)).clamp_min(1)
-    sam_values = angle.sum(dim=(1, 2)) / valid_count
-    if REPORT_SAM_IN_DEGREES:
-        sam_values = torch.rad2deg(sam_values)
-
-    ssim_values = ssim_per_sample(prediction, target)
-
-    metrics = {
-        "mrae": mrae_values,
-        "rmse": rmse_values,
-        "sam": sam_values,
-        "psnr": psnr_values,
-        "ssim": ssim_values,
-    }
-    for name, values in metrics.items():
-        if not torch.isfinite(values).all():
-            raise FloatingPointError(
-                f"Non-finite {name} values: {values.detach().cpu().tolist()}"
-            )
-    return metrics
-
-
-@torch.no_grad()
-def calculate_metrics(
-    prediction: torch.Tensor,
-    target: torch.Tensor,
-) -> Dict[str, float]:
-    """Return image-averaged metrics for inference reporting."""
-    tensors = calculate_metric_tensors(prediction, target)
-    return {name: float(values.mean().item()) for name, values in tensors.items()}
-
-
-def print_range_diagnostics(
-    rgb: torch.Tensor,
-    hsi: torch.Tensor,
-    prefix: str,
-) -> None:
-    rgb_min = float(rgb.detach().min().item())
-    rgb_max = float(rgb.detach().max().item())
-    hsi_min = float(hsi.detach().min().item())
-    hsi_max = float(hsi.detach().max().item())
-    near_zero_fraction = float(
-        (hsi.detach().abs() < MRAE_EPSILON).float().mean().item()
-    )
-    print(
-        f"{prefix} ranges | RGB=[{rgb_min:.6f}, {rgb_max:.6f}] | "
-        f"HSI=[{hsi_min:.6f}, {hsi_max:.6f}] | "
-        f"HSI |x|<{MRAE_EPSILON:g}: {100.0 * near_zero_fraction:.3f}%"
-    )
-    if WARN_ON_RANGE_MISMATCH and (
-        hsi_min < -1e-4 or hsi_max > METRIC_DATA_RANGE + 1e-4
-    ):
-        print(
-            "WARNING: HSI values are outside the expected metric range "
-            f"[0, {METRIC_DATA_RANGE}]. Set NORMALIZATION or "
-            "METRIC_DATA_RANGE consistently before interpreting PSNR/SSIM."
-        )
-
-
-class ResidualHeatmap(nn.Module):
-    """Collapse the spectral residual into one spatial error map."""
-
-    def __init__(self, reduction: str = "mae"):
-        super().__init__()
-        if reduction not in {"mae", "rmse"}:
-            raise ValueError("HEATMAP_REDUCTION must be 'mae' or 'rmse'")
-        self.reduction = reduction
-
-    def forward(
+    def _load_pair(
         self,
-        prediction: torch.Tensor,
-        target: torch.Tensor,
-    ) -> torch.Tensor:
-        residual = prediction - target
-        if self.reduction == "rmse":
-            return residual.square().mean(dim=1, keepdim=True).sqrt()
-        return residual.abs().mean(dim=1, keepdim=True)
+        pair_index: int,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Path,
+        Path,
+    ]:
+        hsi_path, rgb_path = self.pairs[pair_index]
 
+        hsi_array = convert_hsi_to_chw(
+            load_hsi_file(hsi_path),
+            hsi_channels=self.hsi_channels,
+            file_path=hsi_path,
+        )
+        hsi_array = normalize_hsi_cube(
+            hsi_array,
+            mode=self.normalization,
+        )
 
-def save_heatmap(heatmap: torch.Tensor, path: Path, title: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    array = heatmap[0, 0].detach().cpu().numpy()
+        rgb_array = load_rgb_file(rgb_path)
 
-    plt.figure(figsize=(7, 6))
-    image = plt.imshow(array, cmap="inferno")
-    plt.colorbar(image, label="Residual magnitude")
-    plt.title(title)
-    plt.axis("off")
-    plt.tight_layout()
-    plt.savefig(path, dpi=200, bbox_inches="tight")
-    plt.close()
+        if hsi_array.shape[1:] != rgb_array.shape[1:]:
+            raise ValueError(
+                f"Spatial mismatch for pair {hsi_path.stem}: "
+                f"HSI={hsi_array.shape[1:]}, "
+                f"RGB={rgb_array.shape[1:]}."
+            )
 
+        if not np.isfinite(hsi_array).all():
+            raise ValueError(
+                f"HSI contains NaN/Inf: {hsi_path}"
+            )
+        if not np.isfinite(rgb_array).all():
+            raise ValueError(
+                f"RGB contains NaN/Inf: {rgb_path}"
+            )
 
-# ============================================================
-# Frozen MST++ + residual Brownian-bridge model
-# ============================================================
+        hsi = torch.from_numpy(
+            hsi_array.copy()
+        ).float()
+        rgb = torch.from_numpy(
+            rgb_array.copy()
+        ).float()
 
-class SinusoidalTimeEmbedding(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        self.dim = dim
+        return hsi, rgb, hsi_path, rgb_path
 
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        half = self.dim // 2
-        if half <= 1:
-            frequencies = torch.ones(1, device=t.device, dtype=t.dtype)
+    def __getitem__(self, index: int):
+        if self.training:
+            pair_index = (
+                index // self.patches_per_image
+            )
         else:
-            frequencies = torch.exp(
-                -math.log(10000.0)
-                * torch.arange(half, device=t.device, dtype=t.dtype)
-                / float(half - 1)
-            )
+            pair_index = index
 
-        angles = t[:, None] * frequencies[None, :]
-        embedding = torch.cat([angles.sin(), angles.cos()], dim=-1)
-        if embedding.shape[-1] < self.dim:
-            embedding = F.pad(embedding, (0, self.dim - embedding.shape[-1]))
-        return embedding
-
-
-class MSTResidualDenoiser(nn.Module):
-    """Predict ground_truth_hsi - coarse_hsi from a Brownian-bridge state."""
-
-    def __init__(
-        self,
-        hsi_channels: int = 31,
-        rgb_channels: int = 3,
-        n_feat: int = 31,
-        body_depth: int = 3,
-        mst_stage: int = 2,
-        num_blocks: Tuple[int, ...] = (1, 1, 1),
-    ):
-        super().__init__()
-        self.pad_multiple = 2 ** mst_stage
-
-        input_channels = hsi_channels + hsi_channels + rgb_channels
-        self.conv_in = nn.Conv2d(
-            input_channels, n_feat, kernel_size=3, stride=1, padding=1, bias=False
+        hsi, rgb, hsi_path, rgb_path = (
+            self._load_pair(pair_index)
         )
-        self.time_mlp = nn.Sequential(
-            SinusoidalTimeEmbedding(n_feat),
-            nn.Linear(n_feat, n_feat * 4),
-            nn.GELU(),
-            nn.Linear(n_feat * 4, n_feat),
-        )
-        self.body = nn.Sequential(
-            *[
-                MST(
-                    in_dim=n_feat,
-                    out_dim=n_feat,
-                    dim=n_feat,
-                    stage=mst_stage,
-                    num_blocks=list(num_blocks),
+
+        if self.crop_size is not None:
+            if self.training:
+                hsi, rgb = random_crop_pair(
+                    hsi,
+                    rgb,
+                    crop_size=self.crop_size,
                 )
-                for _ in range(body_depth)
-            ]
-        )
-        # No sigmoid: an HSI residual must be allowed to be positive or negative.
-        self.conv_out = nn.Conv2d(
-            n_feat, hsi_channels, kernel_size=3, stride=1, padding=1, bias=False
-        )
+            else:
+                hsi, rgb = center_crop_pair(
+                    hsi,
+                    rgb,
+                    crop_size=self.crop_size,
+                )
 
-    def forward(
-        self,
-        x_t: torch.Tensor,
-        coarse_hsi: torch.Tensor,
-        rgb: torch.Tensor,
-        t: torch.Tensor,
-        total_steps: int,
-    ) -> torch.Tensor:
-        if x_t.shape != coarse_hsi.shape:
-            raise ValueError(
-                "x_t and coarse_hsi must have the same shape; "
-                f"received {tuple(x_t.shape)} and {tuple(coarse_hsi.shape)}"
+        if self.training and self.augment:
+            hsi, rgb = augment_pair(
+                hsi,
+                rgb,
             )
-        if rgb.shape[0] != x_t.shape[0] or rgb.shape[-2:] != x_t.shape[-2:]:
-            raise ValueError("RGB and HSI tensors must share batch and spatial dimensions")
 
-        _, _, original_h, original_w = x_t.shape
-        pad_h = (self.pad_multiple - original_h % self.pad_multiple) % self.pad_multiple
-        pad_w = (self.pad_multiple - original_w % self.pad_multiple) % self.pad_multiple
-
-        inputs = torch.cat([x_t, coarse_hsi, rgb], dim=1)
-        if pad_h or pad_w:
-            mode = (
-                "reflect"
-                if original_h > pad_h and original_w > pad_w
-                else "replicate"
+        if self.return_paths:
+            return (
+                hsi,
+                rgb,
+                str(hsi_path),
+                str(rgb_path),
             )
-            inputs = F.pad(inputs, (0, pad_w, 0, pad_h), mode=mode)
 
-        features = self.conv_in(inputs)
-        normalized_t = t.float() / float(total_steps)
-        time_features = self.time_mlp(normalized_t).to(features.dtype)
-        features = features + time_features[:, :, None, None]
-        features = self.body(features)
-        residual = self.conv_out(features)
-        return residual[:, :, :original_h, :original_w]
+        return hsi, rgb
 
 
-class ResidualBBDM(nn.Module):
-    def __init__(
-        self,
-        denoiser: nn.Module,
-        num_timesteps: int = 20,
-        midpoint_variance: float = 0.05,
+
+# ============================================================================
+# Residual-diffusion construction and checkpoint handling
+# ============================================================================
+
+def _load_torch_checkpoint(
+    path: str | Path,
+    device: torch.device | str,
+):
+    try:
+        return torch.load(
+            path,
+            map_location=device,
+            weights_only=False,
+        )
+    except TypeError:
+        return torch.load(
+            path,
+            map_location=device,
+        )
+
+
+def _strip_module_prefix(
+    state_dict: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    if not state_dict:
+        return state_dict
+
+    if all(
+        key.startswith("module.")
+        for key in state_dict
     ):
-        super().__init__()
-        if num_timesteps < 2:
-            raise ValueError("num_timesteps must be at least 2")
-        if midpoint_variance <= 0:
-            raise ValueError("midpoint_variance must be positive")
-
-        self.denoiser = denoiser
-        self.num_timesteps = int(num_timesteps)
-
-        m_schedule = torch.linspace(0.0, 1.0, self.num_timesteps + 1)
-        delta_schedule = (
-            4.0 * midpoint_variance * m_schedule * (1.0 - m_schedule)
-        )
-        delta_schedule[0] = 0.0
-        delta_schedule[-1] = 0.0
-
-        self.register_buffer("m_schedule", m_schedule)
-        self.register_buffer("delta_schedule", delta_schedule)
-
-    @staticmethod
-    def _extract(
-        values: torch.Tensor,
-        t: torch.Tensor,
-        reference: torch.Tensor,
-    ) -> torch.Tensor:
-        extracted = values.gather(0, t)
-        shape = (t.shape[0],) + (1,) * (reference.ndim - 1)
-        return extracted.reshape(shape).to(reference.dtype)
-
-    def q_sample(
-        self,
-        ground_truth: torch.Tensor,
-        coarse_hsi: torch.Tensor,
-        t: torch.Tensor,
-        noise: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if noise is None:
-            noise = torch.randn_like(ground_truth)
-
-        m_t = self._extract(self.m_schedule, t, ground_truth)
-        delta_t = self._extract(self.delta_schedule, t, ground_truth)
-        x_t = (
-            (1.0 - m_t) * ground_truth
-            + m_t * coarse_hsi
-            + torch.sqrt(delta_t.clamp_min(0.0)) * noise
-        )
-        return x_t, noise
-
-    def training_predictions(
-        self,
-        rgb: torch.Tensor,
-        coarse_hsi: torch.Tensor,
-        ground_truth: torch.Tensor,
-        t: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        batch_size = ground_truth.shape[0]
-        if t is None:
-            t = torch.randint(
-                low=1,
-                high=self.num_timesteps + 1,
-                size=(batch_size,),
-                device=ground_truth.device,
-                dtype=torch.long,
-            )
-
-        x_t, noise = self.q_sample(ground_truth, coarse_hsi, t)
-        predicted_residual = self.denoiser(
-            x_t=x_t,
-            coarse_hsi=coarse_hsi,
-            rgb=rgb,
-            t=t,
-            total_steps=self.num_timesteps,
-        )
-        target_residual = ground_truth - coarse_hsi
-        reconstruction = coarse_hsi + predicted_residual
-
         return {
-            "t": t,
-            "x_t": x_t,
-            "noise": noise,
-            "target_residual": target_residual,
-            "predicted_residual": predicted_residual,
-            "reconstruction": reconstruction,
+            key[len("module."):]: value
+            for key, value in state_dict.items()
         }
 
-    @torch.no_grad()
-    def sample(
-        self,
-        rgb: torch.Tensor,
-        coarse_hsi: torch.Tensor,
-        clip_denoised: bool,
-        stochastic: bool = False,
-    ) -> torch.Tensor:
-        x_t = coarse_hsi.clone()
-        endpoint = coarse_hsi
-        batch_size = coarse_hsi.shape[0]
-
-        for step in range(self.num_timesteps, 0, -1):
-            t = torch.full(
-                (batch_size,),
-                step,
-                device=coarse_hsi.device,
-                dtype=torch.long,
-            )
-            predicted_residual = self.denoiser(
-                x_t=x_t,
-                coarse_hsi=coarse_hsi,
-                rgb=rgb,
-                t=t,
-                total_steps=self.num_timesteps,
-            )
-            x0_hat = coarse_hsi + predicted_residual
-            if clip_denoised:
-                x0_hat = x0_hat.clamp(0.0, METRIC_DATA_RANGE)
-
-            if step == 1:
-                x_t = x0_hat
-                break
-
-            t_previous = torch.full_like(t, step - 1)
-            m_t = self._extract(self.m_schedule, t, x_t)
-            delta_t = self._extract(self.delta_schedule, t, x_t)
-            m_previous = self._extract(self.m_schedule, t_previous, x_t)
-            delta_previous = self._extract(self.delta_schedule, t_previous, x_t)
-
-            previous_bridge_mean = (
-                (1.0 - m_previous) * x0_hat + m_previous * endpoint
-            )
-
-            if step == self.num_timesteps:
-                posterior_mean = previous_bridge_mean
-                posterior_variance = delta_previous
-            else:
-                transition_scale = (
-                    (1.0 - m_t) / (1.0 - m_previous).clamp_min(1e-8)
-                )
-                transition_variance = (
-                    delta_t - transition_scale.square() * delta_previous
-                ).clamp_min(1e-12)
-                posterior_mean = (
-                    (transition_variance / delta_t.clamp_min(1e-12))
-                    * previous_bridge_mean
-                    + (
-                        transition_scale
-                        * delta_previous
-                        / delta_t.clamp_min(1e-12)
-                    )
-                    * (x_t - (1.0 - transition_scale) * endpoint)
-                )
-                posterior_variance = (
-                    delta_previous
-                    * transition_variance
-                    / delta_t.clamp_min(1e-12)
-                ).clamp_min(0.0)
-
-            if stochastic:
-                x_t = (
-                    posterior_mean
-                    + torch.sqrt(posterior_variance) * torch.randn_like(x_t)
-                )
-            else:
-                x_t = posterior_mean
-
-        return x_t
-
-
-class MSTPlusPlusResidualBBDM(nn.Module):
-    def __init__(self, coarse_model: nn.Module, bridge: ResidualBBDM):
-        super().__init__()
-        self.coarse_model = coarse_model
-        self.bridge = bridge
-        self.freeze_coarse_model()
-
-    def freeze_coarse_model(self) -> None:
-        self.coarse_model.requires_grad_(False)
-        self.coarse_model.eval()
-
-    def train(self, mode: bool = True):
-        super().train(mode)
-        # super().train() changes every child module; immediately restore MST++.
-        self.coarse_model.eval()
-        return self
-
-    def get_coarse(self, rgb: torch.Tensor) -> torch.Tensor:
-        self.coarse_model.eval()
-        with torch.no_grad():
-            return unwrap_prediction(self.coarse_model(rgb))
-
-    def forward(
-        self,
-        rgb: torch.Tensor,
-        ground_truth: torch.Tensor,
-        t: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        coarse_hsi = self.get_coarse(rgb)
-        outputs = self.bridge.training_predictions(
-            rgb=rgb,
-            coarse_hsi=coarse_hsi,
-            ground_truth=ground_truth,
-            t=t,
-        )
-        outputs["coarse_hsi"] = coarse_hsi
-        return outputs
-
-    @torch.no_grad()
-    def reconstruct(
-        self,
-        rgb: torch.Tensor,
-        clip_denoised: bool,
-        stochastic: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        coarse_hsi = self.get_coarse(rgb)
-        refined_hsi = self.bridge.sample(
-            rgb=rgb,
-            coarse_hsi=coarse_hsi,
-            clip_denoised=clip_denoised,
-            stochastic=stochastic,
-        )
-        return coarse_hsi, refined_hsi
-
-
-def load_checkpoint_file(path: Path, map_location) -> dict:
-    try:
-        return torch.load(path, map_location=map_location, weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location=map_location)
-
-
-def extract_model_state_dict(checkpoint) -> Dict[str, torch.Tensor]:
-    if isinstance(checkpoint, dict):
-        for key in ("model_state_dict", "state_dict", "params", "model"):
-            value = checkpoint.get(key)
-            if isinstance(value, dict) and value:
-                return value
-        if checkpoint and all(isinstance(value, torch.Tensor) for value in checkpoint.values()):
-            return checkpoint
-    raise KeyError(
-        "Could not find a model state dictionary. Expected model_state_dict, "
-        "state_dict, params, model, or a direct tensor dictionary."
-    )
-
-
-def remove_prefix_if_present(
-    state_dict: Dict[str, torch.Tensor],
-    prefix: str,
-) -> Dict[str, torch.Tensor]:
-    if state_dict and all(key.startswith(prefix) for key in state_dict):
-        return {key[len(prefix):]: value for key, value in state_dict.items()}
     return state_dict
 
 
-def load_frozen_mstpp(
-    checkpoint_path: Path,
-    device: torch.device,
-) -> MST_Plus_Plus:
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"MST++ checkpoint does not exist: {checkpoint_path}")
+def _extract_state_dict(
+    checkpoint,
+    candidate_keys: Sequence[str],
+) -> Dict[str, torch.Tensor]:
+    if isinstance(checkpoint, dict):
+        for key in candidate_keys:
+            state = checkpoint.get(key)
+            if isinstance(state, dict):
+                return _strip_module_prefix(state)
 
-    checkpoint = load_checkpoint_file(checkpoint_path, map_location="cpu")
-    checkpoint_config = checkpoint.get("model_config", {}) if isinstance(checkpoint, dict) else {}
+        if checkpoint and all(
+            torch.is_tensor(value)
+            for value in checkpoint.values()
+        ):
+            return _strip_module_prefix(checkpoint)
 
-    model = MST_Plus_Plus(
-        in_channels=int(checkpoint_config.get("in_channels", 3)),
-        out_channels=int(checkpoint_config.get("out_channels", HSI_CHANNELS)),
-        n_feat=int(checkpoint_config.get("n_feat", MSTPP_FEATURES)),
-        stage=int(checkpoint_config.get("stage", MSTPP_STAGES)),
+    raise KeyError(
+        "Could not locate a residual-diffusion state_dict in the checkpoint."
     )
 
-    state_dict = extract_model_state_dict(checkpoint)
-    state_dict = remove_prefix_if_present(state_dict, "module.")
-    state_dict = remove_prefix_if_present(state_dict, "coarse_model.")
-    model.load_state_dict(state_dict, strict=True)
 
-    model.requires_grad_(False)
-    model.eval()
+def default_model_config() -> dict:
+    return {
+        "hsi_channels": HSI_CHANNELS,
+        "rgb_channels": RGB_CHANNELS,
+        "n_feat": RESIDUAL_N_FEAT,
+        "body_depth": RESIDUAL_BODY_DEPTH,
+        "mst_stage": MST_DENOISER_STAGE,
+        "num_blocks": tuple(MST_DENOISER_NUM_BLOCKS),
+        "num_timesteps": NUM_DIFFUSION_STEPS,
+        "midpoint_variance": MIDPOINT_VARIANCE,
+    }
+
+
+def _load_mst_weights(
+    coarse_model: torch.nn.Module,
+) -> None:
+    checkpoint = _load_torch_checkpoint(
+        MST_CHECKPOINT,
+        device="cpu",
+    )
+
+    state_dict = _extract_state_dict(
+        checkpoint,
+        candidate_keys=(
+            "model_state_dict",
+            "mst_state_dict",
+            "state_dict",
+            "model",
+        ),
+    )
+
+    coarse_model.load_state_dict(
+        state_dict,
+        strict=STRICT_MST_CHECKPOINT,
+    )
+
+
+def build_residual_diffusion(
+    device: torch.device,
+    model_config: Optional[dict] = None,
+) -> MSTPlusPlusResidualBBDM:
+    config = default_model_config()
+
+    if model_config is not None:
+        for key in config:
+            if key in model_config:
+                config[key] = model_config[key]
+
+    coarse_model = MST_Plus_Plus(
+        **MST_MODEL_KWARGS
+    )
+    _load_mst_weights(coarse_model)
+    coarse_model.float()
+
+    denoiser = MSTResidualDenoiser(
+        hsi_channels=config["hsi_channels"],
+        rgb_channels=config["rgb_channels"],
+        n_feat=config["n_feat"],
+        body_depth=config["body_depth"],
+        mst_stage=config["mst_stage"],
+        num_blocks=tuple(config["num_blocks"]),
+    )
+
+    bridge = ResidualBBDM(
+        denoiser=denoiser,
+        num_timesteps=config["num_timesteps"],
+        midpoint_variance=config["midpoint_variance"],
+    )
+
+    model = MSTPlusPlusResidualBBDM(
+        coarse_model=coarse_model,
+        bridge=bridge,
+        freeze_coarse_model=True,
+    )
+
     return model.to(device)
 
 
-def current_bbdm_config() -> dict:
-    return {
-        "hsi_channels": HSI_CHANNELS,
-        "rgb_channels": 3,
-        "n_feat": BBDM_FEATURES,
-        "body_depth": BBDM_BODY_DEPTH,
-        "mst_stage": BBDM_MST_STAGE,
-        "num_blocks": list(BBDM_NUM_BLOCKS),
-        "num_timesteps": BBDM_TIMESTEPS,
-        "midpoint_variance": BBDM_MIDPOINT_VARIANCE,
-    }
-
-
-def build_pipeline(
-    device: torch.device,
-    bbdm_config: Optional[dict] = None,
-) -> MSTPlusPlusResidualBBDM:
-    config = current_bbdm_config() if bbdm_config is None else bbdm_config
-    coarse_model = load_frozen_mstpp(Path(MSTPP_CHECKPOINT), device)
-
-    denoiser = MSTResidualDenoiser(
-        hsi_channels=int(config.get("hsi_channels", HSI_CHANNELS)),
-        rgb_channels=int(config.get("rgb_channels", 3)),
-        n_feat=int(config.get("n_feat", BBDM_FEATURES)),
-        body_depth=int(config.get("body_depth", BBDM_BODY_DEPTH)),
-        mst_stage=int(config.get("mst_stage", BBDM_MST_STAGE)),
-        num_blocks=tuple(config.get("num_blocks", BBDM_NUM_BLOCKS)),
+def save_checkpoint(
+    output_path: Path,
+    model: MSTPlusPlusResidualBBDM,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    scaler: GradScaler,
+    epoch: int,
+    best_validation_residual_loss: float,
+    validation_metrics: dict,
+) -> None:
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
     )
-    bridge = ResidualBBDM(
-        denoiser=denoiser,
-        num_timesteps=int(config.get("num_timesteps", BBDM_TIMESTEPS)),
-        midpoint_variance=float(
-            config.get("midpoint_variance", BBDM_MIDPOINT_VARIANCE)
+
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+            "best_validation_residual_loss": (
+                best_validation_residual_loss
+            ),
+            "validation_metrics": validation_metrics,
+            "model_config": default_model_config(),
+            "mst_checkpoint": MST_CHECKPOINT,
+        },
+        output_path,
+    )
+
+
+def load_residual_diffusion_weights(
+    model: MSTPlusPlusResidualBBDM,
+    checkpoint,
+) -> None:
+    state_dict = _extract_state_dict(
+        checkpoint,
+        candidate_keys=(
+            "model_state_dict",
+            "residual_bbdm_state_dict",
+            "state_dict",
         ),
     )
-    return MSTPlusPlusResidualBBDM(coarse_model, bridge).to(device)
+
+    model.load_state_dict(
+        state_dict,
+        strict=True,
+    )
 
 
-def assert_mstpp_is_frozen(model: MSTPlusPlusResidualBBDM) -> None:
-    trainable = [name for name, p in model.coarse_model.named_parameters() if p.requires_grad]
-    if trainable:
-        raise RuntimeError(f"MST++ contains trainable parameters: {trainable[:5]}")
-    if model.coarse_model.training:
-        raise RuntimeError("Frozen MST++ must remain in evaluation mode")
+def _extract_tensor_output(output) -> torch.Tensor:
+    """Extract a tensor from common MST++ return formats."""
+    if torch.is_tensor(output):
+        return output
+
+    if isinstance(output, (tuple, list)):
+        for value in output:
+            if torch.is_tensor(value):
+                return value
+
+    if isinstance(output, dict):
+        for key in (
+            "prediction",
+            "output",
+            "out",
+            "hsi",
+            "reconstruction",
+        ):
+            value = output.get(key)
+            if torch.is_tensor(value):
+                return value
+
+        for value in output.values():
+            if torch.is_tensor(value):
+                return value
+
+    raise TypeError(
+        "MST++ must return a tensor, a tensor-containing sequence, "
+        "or a tensor-containing dictionary."
+    )
 
 
-# ============================================================
-# BBDM losses, training, validation, and checkpoints
-# ============================================================
+@torch.no_grad()
+def get_coarse_prediction_fp32(
+    model: MSTPlusPlusResidualBBDM,
+    rgb: torch.Tensor,
+) -> torch.Tensor:
+    """Run frozen MST++ in FP32 outside the surrounding AMP context."""
+    model.coarse_model.eval()
 
-def spectral_cosine_loss(
+    with torch.autocast(
+        device_type=rgb.device.type,
+        enabled=False,
+    ):
+        output = model.coarse_model(
+            rgb.detach().float().contiguous()
+        )
+        coarse_hsi = _extract_tensor_output(output)
+
+    return coarse_hsi.detach().float().contiguous()
+
+
+# ============================================================================
+# Residual diffusion
+# ============================================================================
+
+def sample_training_timesteps(
+    batch_size: int,
+    num_steps: int,
+    device: torch.device,
+) -> torch.Tensor:
+    return torch.randint(
+        1,
+        num_steps + 1,
+        (batch_size,),
+        device=device,
+        dtype=torch.long,
+    )
+
+
+def calculate_training_losses(
+    outputs: Dict[str, torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    residual_l1_loss = F.l1_loss(
+        outputs["predicted_residual"].float(),
+        outputs["target_residual"].float(),
+    )
+
+    reconstruction_l1_loss = F.l1_loss(
+        outputs["reconstruction"].float(),
+        (
+            outputs["coarse_hsi"]
+            + outputs["target_residual"]
+        ).float(),
+    )
+
+    total_loss = (
+        RESIDUAL_L1_WEIGHT
+        * residual_l1_loss
+        + RECONSTRUCTION_L1_WEIGHT
+        * reconstruction_l1_loss
+    )
+
+    return (
+        total_loss,
+        residual_l1_loss,
+        reconstruction_l1_loss,
+    )
+
+# ============================================================================
+# HSI metric aggregation using the project's existing metric functions
+# ============================================================================
+
+def _metric_output_to_scalar(
+    value,
+    metric_name: str,
+) -> float:
+    if not torch.is_tensor(value):
+        value = torch.as_tensor(value)
+
+    value = value.detach().float()
+
+    # The imported functions are expected to return a scalar. Taking the mean
+    # also supports implementations that return a one-element/per-image tensor.
+    if value.numel() != 1:
+        value = value.mean()
+
+    scalar = float(value.item())
+
+    if not math_is_finite_or_positive_infinity(scalar):
+        raise FloatingPointError(
+            f"{metric_name} returned a non-finite value: {scalar}"
+        )
+
+    return scalar
+
+
+def math_is_finite_or_positive_infinity(value: float) -> bool:
+    # Positive infinity is valid for PSNR when prediction exactly equals target.
+    return bool(
+        np.isfinite(value)
+        or value == float("inf")
+    )
+
+
+@torch.no_grad()
+def calculate_project_metrics(
     prediction: torch.Tensor,
     target: torch.Tensor,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """Stable differentiable spectral-direction loss: mean(1 - cosine)."""
-    prediction = prediction.float()
-    target = target.float()
-    dot_product = (prediction * target).sum(dim=1)
-    prediction_norm = prediction.square().sum(dim=1).sqrt()
-    target_norm = target.square().sum(dim=1).sqrt()
-    cosine = dot_product / (prediction_norm * target_norm).clamp_min(eps)
-    return (1.0 - cosine.clamp(-1.0, 1.0)).mean()
+) -> dict:
+    """
+    Calculate metrics with the functions imported from the project's loss folder.
+
+    The argument order matches the user's existing code:
+        metric(target, reconstruction)
+    """
+    prediction = prediction.detach().float()
+    target = target.detach().float()
+
+    if prediction.shape != target.shape:
+        raise ValueError(
+            f"Metric shape mismatch: prediction={prediction.shape}, "
+            f"target={target.shape}"
+        )
+
+    if not torch.isfinite(prediction).all():
+        raise FloatingPointError(
+            "Prediction contains NaN or Inf during metric calculation."
+        )
+    if not torch.isfinite(target).all():
+        raise FloatingPointError(
+            "Target contains NaN or Inf during metric calculation."
+        )
+
+    return {
+        "mrae": _metric_output_to_scalar(
+            mrae(target, prediction),
+            "MRAE",
+        ),
+        "rmse": _metric_output_to_scalar(
+            rmse(target, prediction),
+            "RMSE",
+        ),
+        "sam": _metric_output_to_scalar(
+            sam(target, prediction),
+            "SAM",
+        ),
+        "psnr": _metric_output_to_scalar(
+            psnr(target, prediction),
+            "PSNR",
+        ),
+        "ssim": _metric_output_to_scalar(
+            ssim(target, prediction),
+            "SSIM",
+        ),
+    }
 
 
-def calculate_bbdm_losses(
+@dataclass
+class HSIMetricAccumulator:
+    """
+    Average the project's existing metrics equally over validation images.
+
+    Metrics are called separately for each image. This avoids depending on the
+    internal batch reduction used by each imported function and correctly
+    handles a smaller final batch.
+    """
+
+    data_range: float = 1.0
+    clamp_prediction: bool = False
+
+    mrae_sum: float = 0.0
+    rmse_sum: float = 0.0
+    sam_sum: float = 0.0
+    psnr_sum: float = 0.0
+    ssim_sum: float = 0.0
+    image_count: int = 0
+
+    @torch.no_grad()
+    def update(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+    ) -> None:
+        prediction = prediction.detach().float()
+        target = target.detach().float()
+
+        if prediction.shape != target.shape:
+            raise ValueError(
+                f"Metric shape mismatch: prediction={prediction.shape}, "
+                f"target={target.shape}"
+            )
+
+        if self.clamp_prediction:
+            prediction = prediction.clamp(
+                0.0,
+                self.data_range,
+            )
+
+        for sample_index in range(prediction.shape[0]):
+            sample_metrics = calculate_project_metrics(
+                prediction=prediction[
+                    sample_index:sample_index + 1
+                ],
+                target=target[
+                    sample_index:sample_index + 1
+                ],
+            )
+
+            self.mrae_sum += sample_metrics["mrae"]
+            self.rmse_sum += sample_metrics["rmse"]
+            self.sam_sum += sample_metrics["sam"]
+            self.psnr_sum += sample_metrics["psnr"]
+            self.ssim_sum += sample_metrics["ssim"]
+            self.image_count += 1
+
+    def compute(self) -> dict:
+        if self.image_count == 0:
+            return {
+                "mrae": float("nan"),
+                "rmse": float("nan"),
+                "sam": float("nan"),
+                "psnr": float("nan"),
+                "ssim": float("nan"),
+            }
+
+        denominator = float(self.image_count)
+
+        return {
+            "mrae": self.mrae_sum / denominator,
+            "rmse": self.rmse_sum / denominator,
+            "sam": self.sam_sum / denominator,
+            "psnr": self.psnr_sum / denominator,
+            "ssim": self.ssim_sum / denominator,
+        }
+
+
+
+# ============================================================================
+# Discrete diffusion-timestep loss tracking
+# ============================================================================
+
+def create_timestep_tracker(
+    num_steps: int,
+) -> dict:
+    return {
+        step: {
+            "loss_sum": 0.0,
+            "count": 0,
+        }
+        for step in range(1, num_steps + 1)
+    }
+
+
+@torch.no_grad()
+def update_timestep_tracker(
+    tracker: dict,
+    timestep: torch.Tensor,
     predicted_residual: torch.Tensor,
     target_residual: torch.Tensor,
-    reconstruction: torch.Tensor,
-    target_hsi: torch.Tensor,
-) -> Dict[str, torch.Tensor]:
-    predicted_residual = predicted_residual.float()
-    target_residual = target_residual.float()
-    reconstruction = reconstruction.float()
-    target_hsi = target_hsi.float()
-
-    residual_loss = F.smooth_l1_loss(
-        predicted_residual,
-        target_residual,
-        beta=SMOOTH_L1_BETA,
-    )
-    reconstruction_value = F.l1_loss(reconstruction, target_hsi)
-    spectral_value = spectral_cosine_loss(reconstruction, target_hsi)
-    total = (
-        RESIDUAL_LOSS_WEIGHT * residual_loss
-        + RECONSTRUCTION_LOSS_WEIGHT * reconstruction_value
-        + SPECTRAL_LOSS_WEIGHT * spectral_value
-    )
-    return {
-        "total_loss": total,
-        "residual_loss": residual_loss,
-        "reconstruction_loss": reconstruction_value,
-        "spectral_loss": spectral_value,
-    }
-
-
-def empty_epoch_sums() -> Dict[str, float]:
-    return {
-        "total_loss": 0.0,
-        "residual_loss": 0.0,
-        "reconstruction_loss": 0.0,
-        "spectral_loss": 0.0,
-        "coarse_mrae": 0.0,
-        "mrae": 0.0,
-        "rmse": 0.0,
-        "sam": 0.0,
-        "psnr": 0.0,
-        "ssim": 0.0,
-    }
-
-
-def add_batch_results(
-    sums: Dict[str, float],
-    losses: Dict[str, torch.Tensor],
-    coarse_metrics: Dict[str, torch.Tensor],
-    refined_metrics: Dict[str, torch.Tensor],
-    batch_size: int,
 ) -> None:
-    for name, value in losses.items():
-        sums[name] += float(value.detach().item()) * batch_size
-    sums["coarse_mrae"] += float(coarse_metrics["mrae"].detach().sum().item())
-    for name, values in refined_metrics.items():
-        sums[name] += float(values.detach().sum().item())
+    per_sample_loss = F.l1_loss(
+        predicted_residual.detach().float(),
+        target_residual.detach().float(),
+        reduction="none",
+    ).mean(dim=(1, 2, 3))
+
+    for step in tracker:
+        mask = timestep == step
+
+        if not mask.any():
+            continue
+
+        tracker[step]["loss_sum"] += (
+            per_sample_loss[mask].sum().item()
+        )
+        tracker[step]["count"] += int(
+            mask.sum().item()
+        )
 
 
-def average_epoch_sums(sums: Dict[str, float], count: int) -> Dict[str, float]:
-    if count == 0:
-        raise RuntimeError("No samples were processed")
-    return {name: value / count for name, value in sums.items()}
+def finalize_timestep_tracker(
+    tracker: dict,
+) -> dict:
+    result = {}
+
+    for step, values in tracker.items():
+        count = values["count"]
+        result[str(step)] = {
+            "residual_l1": (
+                values["loss_sum"] / count
+                if count > 0
+                else float("nan")
+            ),
+            "count": count,
+        }
+
+    return result
 
 
-def print_bbdm_metrics(prefix: str, values: Dict[str, float]) -> None:
-    sam_label = "SAM(deg)" if REPORT_SAM_IN_DEGREES else "SAM(rad)"
-    print(
-        f"{prefix} | "
-        f"Total: {values['total_loss']:.6f} | "
-        f"Residual: {values['residual_loss']:.6f} | "
-        f"Recon-L1: {values['reconstruction_loss']:.6f} | "
-        f"Spectral: {values['spectral_loss']:.6f} | "
-        f"Coarse MRAE: {values['coarse_mrae']:.6f} | "
-        f"Refined MRAE: {values['mrae']:.6f} | "
-        f"RMSE: {values['rmse']:.6f} | "
-        f"{sam_label}: {values['sam']:.6f} | "
-        f"PSNR: {values['psnr']:.4f} dB | "
-        f"SSIM: {values['ssim']:.4f}"
-    )
+def print_timestep_tracker(
+    title: str,
+    result: dict,
+) -> None:
+    print(f"\n{title}")
 
+    for step, values in result.items():
+        count = values["count"]
+        loss = values["residual_l1"]
+
+        if count == 0:
+            print(
+                f"  t={step} | no samples"
+            )
+        else:
+            print(
+                f"  t={step} | "
+                f"residual L1={loss:.6f} | "
+                f"samples={count}"
+            )
+
+
+# ============================================================================
+# Training and validation
+# ============================================================================
 
 def train_one_epoch(
     model: MSTPlusPlusResidualBBDM,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    scaler: torch.amp.GradScaler,
+    scaler: GradScaler,
     device: torch.device,
     use_amp: bool,
-) -> Dict[str, float]:
+) -> dict:
     model.train()
-    assert_mstpp_is_frozen(model)
 
-    sums = empty_epoch_sums()
-    sample_count = 0
     trainable_parameters = [
-        parameter for parameter in model.bridge.parameters() if parameter.requires_grad
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad
     ]
 
-    for batch_index, (rgb, hsi) in enumerate(loader, start=1):
-        rgb = rgb.to(device, non_blocking=True)
-        hsi = hsi.to(device, non_blocking=True)
-        optimizer.zero_grad(set_to_none=True)
+    total_loss_sum = 0.0
+    residual_l1_sum = 0.0
+    reconstruction_l1_sum = 0.0
+    total_samples = 0
 
-        if batch_index == 1:
-            print_range_diagnostics(rgb, hsi, "  Train")
+    metric_accumulator = HSIMetricAccumulator(
+        data_range=METRIC_DATA_RANGE,
+        clamp_prediction=(
+            CLAMP_PREDICTION_FOR_METRICS
+        ),
+    )
 
-        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-            outputs = model(rgb=rgb, ground_truth=hsi)
+    metric_batches = 0
+    timestep_tracker = create_timestep_tracker(
+        model.bridge.num_timesteps
+    )
 
-        # Losses are always evaluated in float32 outside autocast.
-        with torch.amp.autocast(device_type=device.type, enabled=False):
-            losses = calculate_bbdm_losses(
-                predicted_residual=outputs["predicted_residual"],
-                target_residual=outputs["target_residual"],
-                reconstruction=outputs["reconstruction"],
-                target_hsi=hsi,
-            )
-        total_loss = losses["total_loss"]
-        if not torch.isfinite(total_loss):
-            raise FloatingPointError(
-                f"Non-finite BBDM training loss at batch {batch_index}: "
-                f"{total_loss.item()}"
-            )
+    skipped_nonfinite_batches = 0
+    consecutive_nonfinite_batches = 0
 
-        scaler.scale(total_loss).backward()
-        scaler.unscale_(optimizer)
-
-        gradients_are_finite = all(
-            parameter.grad is None or torch.isfinite(parameter.grad).all().item()
-            for parameter in trainable_parameters
+    for batch_index, (hsi, rgb) in enumerate(
+        loader,
+        start=1,
+    ):
+        hsi = hsi.to(
+            device,
+            non_blocking=True,
         )
-        if not gradients_are_finite:
-            if not use_amp:
-                raise FloatingPointError(
-                    f"Non-finite BBDM gradients at batch {batch_index} with AMP disabled"
-                )
-            previous_scale = scaler.get_scale()
-            optimizer.zero_grad(set_to_none=True)
-            scaler.update()
-            print(
-                f"WARNING: skipped batch {batch_index} because AMP gradients "
-                f"overflowed; scale {previous_scale:g} -> {scaler.get_scale():g}"
+        rgb = rgb.to(
+            device,
+            non_blocking=True,
+        )
+
+        optimizer.zero_grad(
+            set_to_none=True
+        )
+
+        timestep = sample_training_timesteps(
+            batch_size=hsi.shape[0],
+            num_steps=model.bridge.num_timesteps,
+            device=device,
+        )
+
+        # Keep the frozen MST++ branch in FP32. Only the trainable bridge
+        # denoiser is evaluated under AMP.
+        coarse_hsi = get_coarse_prediction_fp32(
+            model=model,
+            rgb=rgb,
+        )
+
+        with autocast_context(
+            device=device,
+            enabled=use_amp,
+        ):
+            outputs = model.bridge.training_predictions(
+                rgb=rgb,
+                coarse_hsi=coarse_hsi,
+                ground_truth=hsi,
+                t=timestep,
             )
-            continue
+            outputs["coarse_hsi"] = coarse_hsi
+
+            (
+                loss,
+                residual_l1_loss,
+                reconstruction_l1_loss,
+            ) = calculate_training_losses(
+                outputs
+            )
+
+        if not torch.isfinite(loss):
+            raise FloatingPointError(
+                f"Non-finite training loss at batch "
+                f"{batch_index}: {loss.item()}"
+            )
+
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
 
         gradient_norm = torch.nn.utils.clip_grad_norm_(
             trainable_parameters,
-            GRADIENT_CLIP_NORM,
-            error_if_nonfinite=True,
+            max_norm=GRADIENT_CLIP_NORM,
+            error_if_nonfinite=False,
         )
+
         if not torch.isfinite(gradient_norm):
-            raise FloatingPointError(
-                f"Non-finite gradient norm at batch {batch_index}: {gradient_norm.item()}"
+            skipped_nonfinite_batches += 1
+            consecutive_nonfinite_batches += 1
+
+            optimizer.zero_grad(
+                set_to_none=True
             )
+
+            old_scale = (
+                float(scaler.get_scale())
+                if scaler.is_enabled()
+                else 1.0
+            )
+
+            if scaler.is_enabled():
+                new_scale = max(
+                    old_scale * 0.5,
+                    1.0,
+                )
+                scaler.update(
+                    new_scale=new_scale
+                )
+            else:
+                new_scale = old_scale
+
+            print(
+                "\n  Warning: skipped batch "
+                f"{batch_index} because the gradient norm was "
+                f"{float(gradient_norm)}. "
+                f"loss={float(loss.detach()):.6g}, "
+                f"t=[{int(timestep.min())}, "
+                f"{int(timestep.max())}], "
+                f"|target residual|max="
+                f"{float(outputs['target_residual'].detach().abs().max()):.4g}, "
+                f"|x_t|max="
+                f"{float(outputs['x_t'].detach().abs().max()):.4g}, "
+                f"|predicted residual|max="
+                f"{float(outputs['predicted_residual'].detach().abs().max()):.4g}, "
+                f"AMP scale {old_scale:.1f} -> {new_scale:.1f}."
+            )
+
+            if (
+                consecutive_nonfinite_batches
+                >= MAX_CONSECUTIVE_NONFINITE_GRADIENTS
+            ):
+                raise FloatingPointError(
+                    "Persistent non-finite gradients: "
+                    f"{consecutive_nonfinite_batches} consecutive "
+                    "batches failed. Reduce LEARNING_RATE, disable AMP, "
+                    "and inspect the printed input/residual magnitudes."
+                )
+
+            continue
+
+        consecutive_nonfinite_batches = 0
 
         scaler.step(optimizer)
         scaler.update()
 
-        batch_size = rgb.shape[0]
-        coarse_metrics = calculate_metric_tensors(outputs["coarse_hsi"], hsi)
-        refined_metrics = calculate_metric_tensors(outputs["reconstruction"], hsi)
-        add_batch_results(sums, losses, coarse_metrics, refined_metrics, batch_size)
-        sample_count += batch_size
+        update_timestep_tracker(
+            tracker=timestep_tracker,
+            timestep=outputs["t"].detach(),
+            predicted_residual=outputs["predicted_residual"],
+            target_residual=outputs["target_residual"],
+        )
 
-        if batch_index % PRINT_EVERY == 0 or batch_index == len(loader):
-            print_bbdm_metrics(
-                f"  Train batch {batch_index:04d}/{len(loader):04d}",
-                average_epoch_sums(sums, sample_count),
+        batch_size = hsi.shape[0]
+        total_loss_sum += (
+            loss.detach().item()
+            * batch_size
+        )
+        residual_l1_sum += (
+            residual_l1_loss.detach().item()
+            * batch_size
+        )
+        reconstruction_l1_sum += (
+            reconstruction_l1_loss.detach().item()
+            * batch_size
+        )
+        total_samples += batch_size
+
+        if (
+            COMPUTE_TRAIN_ONE_STEP_METRICS
+            and batch_index % TRAIN_METRIC_EVERY == 0
+        ):
+            with torch.no_grad():
+                metric_accumulator.update(
+                    prediction=outputs[
+                        "reconstruction"
+                    ],
+                    target=hsi,
+                )
+                metric_batches += 1
+
+        if (
+            batch_index % PRINT_EVERY == 0
+            or batch_index == len(loader)
+        ):
+            message = (
+                f"  Batch {batch_index:04d}/"
+                f"{len(loader):04d} | "
+                f"total={total_loss_sum / total_samples:.6f} | "
+                f"residual L1={residual_l1_sum / total_samples:.6f} | "
+                f"reconstruction L1="
+                f"{reconstruction_l1_sum / total_samples:.6f} | "
+                f"grad={float(gradient_norm):.4f}"
             )
 
-    return average_epoch_sums(sums, sample_count)
+            if metric_batches > 0:
+                current_metrics = (
+                    metric_accumulator.compute()
+                )
+                message += (
+                    f" | one-step MRAE="
+                    f"{current_metrics['mrae']:.6f}"
+                    f" | one-step RMSE="
+                    f"{current_metrics['rmse']:.6f}"
+                    f" | one-step SAM="
+                    f"{current_metrics['sam']:.6f}"
+                    f" | one-step PSNR="
+                    f"{current_metrics['psnr']:.4f}"
+                    f" | one-step SSIM="
+                    f"{current_metrics['ssim']:.4f}"
+                )
+
+            print(message)
+
+    if total_samples == 0:
+        raise RuntimeError(
+            "Every training batch was skipped because of non-finite gradients."
+        )
+
+    result = {
+        "total_loss": (
+            total_loss_sum / total_samples
+        ),
+        "residual_l1": (
+            residual_l1_sum / total_samples
+        ),
+        "reconstruction_l1": (
+            reconstruction_l1_sum / total_samples
+        ),
+        "skipped_nonfinite_batches": skipped_nonfinite_batches,
+        "timestep_losses": (
+            finalize_timestep_tracker(
+                timestep_tracker
+            )
+        ),
+    }
+
+    if metric_batches > 0:
+        one_step_metrics = (
+            metric_accumulator.compute()
+        )
+        result.update(
+            {
+                f"one_step_{key}": value
+                for key, value
+                in one_step_metrics.items()
+            }
+        )
+
+    return result
 
 
 @torch.no_grad()
-def validate(
+def validate_diffusion_loss(
     model: MSTPlusPlusResidualBBDM,
     loader: DataLoader,
     device: torch.device,
     use_amp: bool,
-) -> Dict[str, float]:
-    if VALIDATION_MODE not in {"endpoint", "sample"}:
-        raise ValueError("VALIDATION_MODE must be 'endpoint' or 'sample'")
-
+) -> dict:
     model.eval()
-    assert_mstpp_is_frozen(model)
-    sums = empty_epoch_sums()
-    sample_count = 0
 
-    for batch_index, (rgb, hsi) in enumerate(loader, start=1):
-        rgb = rgb.to(device, non_blocking=True)
-        hsi = hsi.to(device, non_blocking=True)
+    total_loss_sum = 0.0
+    residual_l1_sum = 0.0
+    reconstruction_l1_sum = 0.0
+    total_samples = 0
+    sample_offset = 0
+    timestep_tracker = create_timestep_tracker(
+        model.bridge.num_timesteps
+    )
 
-        if batch_index == 1:
-            print_range_diagnostics(rgb, hsi, "  Validation")
+    generator = torch.Generator(
+        device=device
+    )
+    generator.manual_seed(
+        SEED + 10_000
+    )
 
-        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-            if VALIDATION_MODE == "sample":
-                coarse_hsi, prediction = model.reconstruct(
-                    rgb=rgb,
-                    clip_denoised=CLAMP_INFERENCE_OUTPUT,
-                    stochastic=VALIDATION_STOCHASTIC,
-                )
-                predicted_residual = prediction - coarse_hsi
-                target_residual = hsi - coarse_hsi
-            else:
-                endpoint_t = torch.full(
-                    (rgb.shape[0],),
-                    model.bridge.num_timesteps,
-                    device=device,
-                    dtype=torch.long,
-                )
-                outputs = model(rgb=rgb, ground_truth=hsi, t=endpoint_t)
-                coarse_hsi = outputs["coarse_hsi"]
-                prediction = outputs["reconstruction"]
-                predicted_residual = outputs["predicted_residual"]
-                target_residual = outputs["target_residual"]
+    for hsi, rgb in loader:
+        hsi = hsi.to(
+            device,
+            non_blocking=True,
+        )
+        rgb = rgb.to(
+            device,
+            non_blocking=True,
+        )
 
-        with torch.amp.autocast(device_type=device.type, enabled=False):
-            losses = calculate_bbdm_losses(
-                predicted_residual=predicted_residual,
-                target_residual=target_residual,
-                reconstruction=prediction,
-                target_hsi=hsi,
+        batch_size = hsi.shape[0]
+
+        timestep = (
+            torch.arange(
+                sample_offset,
+                sample_offset + batch_size,
+                device=device,
+            )
+            % model.bridge.num_timesteps
+        ) + 1
+        timestep = timestep.long()
+        sample_offset += batch_size
+
+        noise = torch.randn(
+            hsi.shape,
+            generator=generator,
+            device=device,
+            dtype=hsi.dtype,
+        )
+
+        coarse_hsi = get_coarse_prediction_fp32(
+            model=model,
+            rgb=rgb,
+        )
+
+        with autocast_context(
+            device=device,
+            enabled=use_amp,
+        ):
+            x_t, used_noise = model.bridge.q_sample(
+                ground_truth=hsi,
+                coarse_hsi=coarse_hsi,
+                t=timestep,
+                noise=noise,
+            )
+            predicted_residual = model.bridge.denoiser(
+                x_t=x_t,
+                coarse_hsi=coarse_hsi,
+                rgb=rgb,
+                t=timestep,
+                total_steps=model.bridge.num_timesteps,
+            )
+            target_residual = hsi - coarse_hsi
+            reconstruction = coarse_hsi + predicted_residual
+
+            outputs = {
+                "t": timestep,
+                "x_t": x_t,
+                "noise": used_noise,
+                "target_residual": target_residual,
+                "predicted_residual": predicted_residual,
+                "reconstruction": reconstruction,
+                "coarse_hsi": coarse_hsi,
+            }
+
+            (
+                _,
+                residual_l1_loss,
+                reconstruction_l1_loss,
+            ) = calculate_training_losses(
+                outputs
             )
 
-        batch_size = rgb.shape[0]
-        coarse_metrics = calculate_metric_tensors(coarse_hsi, hsi)
-        refined_metrics = calculate_metric_tensors(prediction, hsi)
-        add_batch_results(sums, losses, coarse_metrics, refined_metrics, batch_size)
-        sample_count += batch_size
+        per_sample_residual_l1 = F.l1_loss(
+            outputs["predicted_residual"].float(),
+            outputs["target_residual"].float(),
+            reduction="none",
+        ).mean(dim=(1, 2, 3))
 
-    return average_epoch_sums(sums, sample_count)
+        per_sample_reconstruction_l1 = F.l1_loss(
+            outputs["reconstruction"].float(),
+            hsi.float(),
+            reduction="none",
+        ).mean(dim=(1, 2, 3))
 
+        per_sample_total = (
+            RESIDUAL_L1_WEIGHT
+            * per_sample_residual_l1
+            + RECONSTRUCTION_L1_WEIGHT
+            * per_sample_reconstruction_l1
+        )
 
-def save_checkpoint(
-    path: Path,
-    model: MSTPlusPlusResidualBBDM,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
-    scaler: torch.amp.GradScaler,
-    epoch: int,
-    best_mrae: float,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "epoch": epoch,
-            # Intentionally save only BBDM weights; frozen MST++ remains external.
-            "bridge_state_dict": model.bridge.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "scaler_state_dict": scaler.state_dict(),
-            "best_mrae": best_mrae,
-            "mstpp_checkpoint": str(MSTPP_CHECKPOINT),
-            "normalization": NORMALIZATION,
-            "validation_mode": VALIDATION_MODE,
-            "bbdm_config": current_bbdm_config(),
-            "loss_config": {
-                "residual_weight": RESIDUAL_LOSS_WEIGHT,
-                "reconstruction_weight": RECONSTRUCTION_LOSS_WEIGHT,
-                "spectral_weight": SPECTRAL_LOSS_WEIGHT,
-                "smooth_l1_beta": SMOOTH_L1_BETA,
-            },
-            "metric_config": {
-                "mrae_epsilon": MRAE_EPSILON,
-                "sam_epsilon": SAM_EPSILON,
-                "data_range": METRIC_DATA_RANGE,
-                "sam_in_degrees": REPORT_SAM_IN_DEGREES,
-            },
-        },
-        path,
-    )
+        total_loss_sum += per_sample_total.sum().item()
+        residual_l1_sum += per_sample_residual_l1.sum().item()
+        reconstruction_l1_sum += (
+            per_sample_reconstruction_l1.sum().item()
+        )
+        total_samples += batch_size
 
+        update_timestep_tracker(
+            tracker=timestep_tracker,
+            timestep=timestep,
+            predicted_residual=outputs["predicted_residual"],
+            target_residual=outputs["target_residual"],
+        )
 
-def load_bridge_checkpoint(
-    model: MSTPlusPlusResidualBBDM,
-    checkpoint: dict,
-) -> None:
-    state_dict = checkpoint.get("bridge_state_dict")
-    if not isinstance(state_dict, dict):
-        raise KeyError("BBDM checkpoint does not contain bridge_state_dict")
-    state_dict = remove_prefix_if_present(state_dict, "module.")
-    state_dict = remove_prefix_if_present(state_dict, "bridge.")
-    model.bridge.load_state_dict(state_dict, strict=True)
-
-
-def train() -> None:
-    set_seed(SEED)
-    device = get_device()
-    use_amp = USE_AMP and device.type == "cuda"
-
-    all_pairs = filter_valid_pairs(build_pairs())
-    random.Random(SEED).shuffle(all_pairs)
-
-    validation_size = max(1, int(len(all_pairs) * VALIDATION_FRACTION))
-    validation_pairs = all_pairs[:validation_size]
-    training_pairs = all_pairs[validation_size:]
-    if not training_pairs:
-        raise RuntimeError("No training pairs remain after the validation split")
-
-    training_dataset = RGBHSIDataset(training_pairs, training=True)
-    validation_dataset = RGBHSIDataset(validation_pairs, training=False)
-
-    loader_options = {
-        "batch_size": BATCH_SIZE,
-        "num_workers": NUM_WORKERS,
-        "pin_memory": device.type == "cuda",
-        "persistent_workers": NUM_WORKERS > 0,
+    return {
+        "total_loss": (
+            total_loss_sum / total_samples
+        ),
+        "residual_l1": (
+            residual_l1_sum / total_samples
+        ),
+        "reconstruction_l1": (
+            reconstruction_l1_sum / total_samples
+        ),
+        "timestep_losses": (
+            finalize_timestep_tracker(
+                timestep_tracker
+            )
+        ),
     }
-    training_loader = DataLoader(
-        training_dataset,
-        shuffle=True,
-        drop_last=False,
-        **loader_options,
+
+
+@torch.no_grad()
+def validate_reconstruction_metrics(
+    model: MSTPlusPlusResidualBBDM,
+    loader: DataLoader,
+    device: torch.device,
+    use_amp: bool,
+    max_images: Optional[int],
+) -> dict:
+    """Compute actual RGB -> HSI metrics using the complete reverse sampler."""
+    model.eval()
+
+    refined_accumulator = HSIMetricAccumulator(
+        data_range=METRIC_DATA_RANGE,
+        clamp_prediction=(
+            CLAMP_PREDICTION_FOR_METRICS
+        ),
     )
-    validation_loader = DataLoader(
-        validation_dataset,
+    mst_accumulator = HSIMetricAccumulator(
+        data_range=METRIC_DATA_RANGE,
+        clamp_prediction=(
+            CLAMP_PREDICTION_FOR_METRICS
+        ),
+    )
+
+    evaluated_images = 0
+
+    rng_devices = []
+    if device.type == "cuda":
+        rng_devices = [
+            device.index
+            if device.index is not None
+            else torch.cuda.current_device()
+        ]
+
+    with torch.random.fork_rng(
+        devices=rng_devices,
+        enabled=True,
+    ):
+        torch.manual_seed(SEED + 20_000)
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(
+                SEED + 20_000
+            )
+
+        for hsi, rgb in loader:
+            if (
+                max_images is not None
+                and evaluated_images >= max_images
+            ):
+                break
+
+            if max_images is not None:
+                remaining = (
+                    max_images - evaluated_images
+                )
+                hsi = hsi[:remaining]
+                rgb = rgb[:remaining]
+
+            hsi = hsi.to(
+                device,
+                non_blocking=True,
+            )
+            rgb = rgb.to(
+                device,
+                non_blocking=True,
+            )
+
+            coarse_hsi = get_coarse_prediction_fp32(
+                model=model,
+                rgb=rgb,
+            )
+
+            with autocast_context(
+                device=device,
+                enabled=use_amp,
+            ):
+                refined_hsi = model.bridge.sample(
+                    rgb=rgb,
+                    coarse_hsi=coarse_hsi,
+                    clip_denoised=INFERENCE_CLIP_DENOISED,
+                    stochastic=INFERENCE_STOCHASTIC,
+                )
+
+            refined_accumulator.update(
+                prediction=refined_hsi,
+                target=hsi,
+            )
+            mst_accumulator.update(
+                prediction=coarse_hsi,
+                target=hsi,
+            )
+
+            evaluated_images += hsi.shape[0]
+
+    refined_metrics = refined_accumulator.compute()
+    mst_metrics = mst_accumulator.compute()
+
+    result = {
+        **refined_metrics,
+        "evaluated_images": evaluated_images,
+        "sampling_steps": model.bridge.num_timesteps,
+    }
+    result.update(
+        {
+            f"mst_{key}": value
+            for key, value in mst_metrics.items()
+        }
+    )
+
+    return result
+
+
+# ============================================================================
+# Inference preview saving
+# ============================================================================
+
+def _normalize_rgb_for_display(
+    rgb: np.ndarray,
+) -> np.ndarray:
+    rgb = np.transpose(
+        rgb,
+        (1, 2, 0),
+    )
+    return np.clip(
+        rgb,
+        0.0,
+        1.0,
+    )
+
+
+def _hsi_to_pseudo_rgb_triplet(
+    target: np.ndarray,
+    mst_prediction: np.ndarray,
+    refined_prediction: np.ndarray,
+    bands: Tuple[int, int, int],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    channel_count = target.shape[0]
+
+    for band in bands:
+        if not 0 <= band < channel_count:
+            raise ValueError(
+                f"Visualization band {band} is outside "
+                f"the valid range [0, {channel_count - 1}]."
+            )
+
+    target_rgb = np.stack(
+        [target[band] for band in bands],
+        axis=-1,
+    )
+    mst_rgb = np.stack(
+        [mst_prediction[band] for band in bands],
+        axis=-1,
+    )
+    refined_rgb = np.stack(
+        [refined_prediction[band] for band in bands],
+        axis=-1,
+    )
+
+    # Use target-derived scaling for all HSI previews.
+    minimum = target_rgb.min(
+        axis=(0, 1),
+        keepdims=True,
+    )
+    maximum = target_rgb.max(
+        axis=(0, 1),
+        keepdims=True,
+    )
+    scale = maximum - minimum + 1e-8
+
+    target_rgb = (
+        target_rgb - minimum
+    ) / scale
+    mst_rgb = (
+        mst_rgb - minimum
+    ) / scale
+    refined_rgb = (
+        refined_rgb - minimum
+    ) / scale
+
+    return (
+        np.clip(target_rgb, 0.0, 1.0),
+        np.clip(mst_rgb, 0.0, 1.0),
+        np.clip(refined_rgb, 0.0, 1.0),
+    )
+
+
+def save_inference_preview(
+    output_path: Path,
+    rgb: np.ndarray,
+    target_hsi: np.ndarray,
+    mst_prediction_hsi: np.ndarray,
+    refined_prediction_hsi: np.ndarray,
+) -> None:
+    rgb_display = _normalize_rgb_for_display(
+        rgb
+    )
+    (
+        target_display,
+        mst_display,
+        refined_display,
+    ) = _hsi_to_pseudo_rgb_triplet(
+        target=target_hsi,
+        mst_prediction=mst_prediction_hsi,
+        refined_prediction=refined_prediction_hsi,
+        bands=VISUALIZATION_BANDS,
+    )
+
+    panels = [
+        rgb_display,
+        target_display,
+        mst_display,
+        refined_display,
+    ]
+
+    panel_images = [
+        Image.fromarray(
+            (panel * 255.0)
+            .round()
+            .astype(np.uint8)
+        )
+        for panel in panels
+    ]
+
+    width = sum(
+        image.width
+        for image in panel_images
+    )
+    height = max(
+        image.height
+        for image in panel_images
+    )
+
+    canvas = Image.new(
+        "RGB",
+        (width, height),
+    )
+
+    x_offset = 0
+    for image in panel_images:
+        canvas.paste(
+            image,
+            (x_offset, 0),
+        )
+        x_offset += image.width
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    canvas.save(output_path)
+
+
+@torch.no_grad()
+def run_random_validation_inference(
+    model: MSTPlusPlusResidualBBDM,
+    validation_pairs: Sequence[
+        Tuple[Path, Path]
+    ],
+    device: torch.device,
+    use_amp: bool,
+    output_directory: Path,
+    number_of_images: int,
+    save_visualizations: bool,
+) -> dict:
+    model.eval()
+
+    if not validation_pairs:
+        raise RuntimeError(
+            "The validation pair list is empty."
+        )
+
+    number_to_select = min(
+        number_of_images,
+        len(validation_pairs),
+    )
+
+    selected_indices = random.Random(
+        SEED
+    ).sample(
+        range(len(validation_pairs)),
+        k=number_to_select,
+    )
+
+    dataset = HSIRGBPairDataset(
+        pairs=validation_pairs,
+        hsi_channels=HSI_CHANNELS,
+        crop_size=None,
+        patches_per_image=1,
+        training=False,
+        normalization=HSI_NORMALIZATION,
+        augment=False,
+        return_paths=True,
+    )
+
+    output_directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    refined_accumulator = HSIMetricAccumulator(
+        data_range=METRIC_DATA_RANGE,
+        clamp_prediction=(
+            CLAMP_PREDICTION_FOR_METRICS
+        ),
+    )
+    mst_accumulator = HSIMetricAccumulator(
+        data_range=METRIC_DATA_RANGE,
+        clamp_prediction=(
+            CLAMP_PREDICTION_FOR_METRICS
+        ),
+    )
+
+    print(
+        f"\nRunning full-resolution inference on "
+        f"{number_to_select} random validation images..."
+    )
+    print(
+        f"Visualizations: "
+        f"{'enabled' if save_visualizations else 'disabled'}"
+    )
+
+    for output_index, dataset_index in enumerate(
+        selected_indices,
+        start=1,
+    ):
+        (
+            hsi,
+            rgb,
+            hsi_path_string,
+            rgb_path_string,
+        ) = dataset[dataset_index]
+
+        (
+            padded_hsi,
+            padded_rgb,
+            original_height,
+            original_width,
+        ) = pad_pair_to_multiple(
+            hsi=hsi,
+            rgb=rgb,
+            multiple=MODEL_DOWNSAMPLE_FACTOR,
+        )
+
+        rgb_batch = (
+            padded_rgb.unsqueeze(0)
+            .to(device)
+        )
+
+        coarse_batch = get_coarse_prediction_fp32(
+            model=model,
+            rgb=rgb_batch,
+        )
+
+        with autocast_context(
+            device=device,
+            enabled=use_amp,
+        ):
+            refined_batch = model.bridge.sample(
+                rgb=rgb_batch,
+                coarse_hsi=coarse_batch,
+                clip_denoised=INFERENCE_CLIP_DENOISED,
+                stochastic=INFERENCE_STOCHASTIC,
+            )
+
+        prediction = refined_batch[
+            :,
+            :,
+            :original_height,
+            :original_width,
+        ].float().cpu()
+
+        mst_prediction = coarse_batch[
+            :,
+            :,
+            :original_height,
+            :original_width,
+        ].float().cpu()
+
+        target_batch = (
+            hsi.unsqueeze(0).float()
+        )
+
+        refined_sample_accumulator = HSIMetricAccumulator(
+            data_range=METRIC_DATA_RANGE,
+            clamp_prediction=(
+                CLAMP_PREDICTION_FOR_METRICS
+            ),
+        )
+        refined_sample_accumulator.update(
+            prediction=prediction,
+            target=target_batch,
+        )
+        refined_metrics = (
+            refined_sample_accumulator.compute()
+        )
+
+        mst_sample_accumulator = HSIMetricAccumulator(
+            data_range=METRIC_DATA_RANGE,
+            clamp_prediction=(
+                CLAMP_PREDICTION_FOR_METRICS
+            ),
+        )
+        mst_sample_accumulator.update(
+            prediction=mst_prediction,
+            target=target_batch,
+        )
+        mst_metrics = mst_sample_accumulator.compute()
+
+        refined_accumulator.update(
+            prediction=prediction,
+            target=target_batch,
+        )
+        mst_accumulator.update(
+            prediction=mst_prediction,
+            target=target_batch,
+        )
+
+        stem = Path(hsi_path_string).stem
+        prefix = (
+            output_directory
+            / f"{output_index:02d}_{stem}"
+        )
+
+        prediction_numpy = prediction[0].numpy()
+        mst_prediction_numpy = mst_prediction[0].numpy()
+        target_numpy = hsi.numpy()
+        rgb_numpy = rgb.numpy()
+
+        np.savez_compressed(
+            str(prefix) + ".npz",
+            prediction=prediction_numpy,
+            mst_prediction=mst_prediction_numpy,
+            predicted_residual=(
+                prediction_numpy
+                - mst_prediction_numpy
+            ),
+            target=target_numpy,
+            rgb=rgb_numpy,
+            hsi_path=hsi_path_string,
+            rgb_path=rgb_path_string,
+            refined_metrics=np.asarray(
+                [
+                    refined_metrics["mrae"],
+                    refined_metrics["rmse"],
+                    refined_metrics["sam"],
+                    refined_metrics["psnr"],
+                    refined_metrics["ssim"],
+                ],
+                dtype=np.float64,
+            ),
+            mst_metrics=np.asarray(
+                [
+                    mst_metrics["mrae"],
+                    mst_metrics["rmse"],
+                    mst_metrics["sam"],
+                    mst_metrics["psnr"],
+                    mst_metrics["ssim"],
+                ],
+                dtype=np.float64,
+            ),
+            metric_names=np.asarray(
+                [
+                    "mrae",
+                    "rmse",
+                    "sam_radians",
+                    "psnr",
+                    "ssim",
+                ]
+            ),
+        )
+
+        if save_visualizations:
+            save_inference_preview(
+                output_path=Path(
+                    str(prefix) + "_preview.png"
+                ),
+                rgb=rgb_numpy,
+                target_hsi=target_numpy,
+                mst_prediction_hsi=(
+                    mst_prediction_numpy
+                ),
+                refined_prediction_hsi=(
+                    prediction_numpy
+                ),
+            )
+
+        print(
+            f"  [{output_index}/{number_to_select}] {stem} | "
+            f"Refined MRAE={refined_metrics['mrae']:.6f} | "
+            f"RMSE={refined_metrics['rmse']:.6f} | "
+            f"SAM={refined_metrics['sam']:.6f} rad | "
+            f"PSNR={refined_metrics['psnr']:.4f} | "
+            f"SSIM={refined_metrics['ssim']:.4f}"
+        )
+        print(
+            f"      MST++ MRAE={mst_metrics['mrae']:.6f} | "
+            f"RMSE={mst_metrics['rmse']:.6f} | "
+            f"SAM={mst_metrics['sam']:.6f} rad | "
+            f"PSNR={mst_metrics['psnr']:.4f} | "
+            f"SSIM={mst_metrics['ssim']:.4f}"
+        )
+
+    refined_overall = refined_accumulator.compute()
+    mst_overall = mst_accumulator.compute()
+
+    metrics_path = (
+        output_directory
+        / "random_inference_metrics.txt"
+    )
+
+    metrics_path.write_text(
+        "\n".join(
+            [
+                f"images={number_to_select}",
+                f"sampling_steps={model.bridge.num_timesteps}",
+                f"visualizations={save_visualizations}",
+                f"refined_mrae={refined_overall['mrae']}",
+                f"refined_rmse={refined_overall['rmse']}",
+                f"refined_sam_radians={refined_overall['sam']}",
+                f"refined_psnr={refined_overall['psnr']}",
+                f"refined_ssim={refined_overall['ssim']}",
+                f"mst_mrae={mst_overall['mrae']}",
+                f"mst_rmse={mst_overall['rmse']}",
+                f"mst_sam_radians={mst_overall['sam']}",
+                f"mst_psnr={mst_overall['psnr']}",
+                f"mst_ssim={mst_overall['ssim']}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    print(
+        "\nRandom inference mean refined metrics | "
+        f"MRAE={refined_overall['mrae']:.6f} | "
+        f"RMSE={refined_overall['rmse']:.6f} | "
+        f"SAM={refined_overall['sam']:.6f} rad | "
+        f"PSNR={refined_overall['psnr']:.4f} | "
+        f"SSIM={refined_overall['ssim']:.4f}"
+    )
+    print(
+        "Random inference mean MST++ metrics | "
+        f"MRAE={mst_overall['mrae']:.6f} | "
+        f"RMSE={mst_overall['rmse']:.6f} | "
+        f"SAM={mst_overall['sam']:.6f} rad | "
+        f"PSNR={mst_overall['psnr']:.4f} | "
+        f"SSIM={mst_overall['ssim']:.4f}"
+    )
+
+    return {
+        "refined": refined_overall,
+        "mst": mst_overall,
+    }
+
+# ============================================================================
+# DataLoader construction
+# ============================================================================
+
+def make_loader(
+    dataset: Dataset,
+    batch_size: int,
+    shuffle: bool,
+    drop_last: bool,
+    device: torch.device,
+) -> DataLoader:
+    generator = torch.Generator()
+    generator.manual_seed(SEED)
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=NUM_WORKERS,
+        pin_memory=(device.type == "cuda"),
+        drop_last=drop_last,
+        persistent_workers=(
+            NUM_WORKERS > 0
+        ),
+        worker_init_fn=seed_worker,
+        generator=generator,
+    )
+
+
+
+# ============================================================================
+# Main workflows
+# ============================================================================
+
+def prepare_pairs(
+    output_directory: Path,
+) -> Tuple[
+    List[Tuple[Path, Path]],
+    List[Tuple[Path, Path]],
+]:
+    train_pairs = pair_hsi_rgb_files(
+        hsi_directory=TRAIN_HSI_DIR,
+        rgb_directory=TRAIN_RGB_DIR,
+    )
+    validation_pairs = pair_hsi_rgb_files(
+        hsi_directory=VALIDATION_HSI_DIR,
+        rgb_directory=VALIDATION_RGB_DIR,
+    )
+
+    train_pairs = filter_valid_pairs(
+        pairs=train_pairs,
+        hsi_channels=HSI_CHANNELS,
+        log_path=(
+            output_directory
+            / "invalid_training_pairs.txt"
+        ),
+        cache_path=TRAIN_PAIR_VALIDATION_CACHE,
+    )
+    validation_pairs = filter_valid_pairs(
+        pairs=validation_pairs,
+        hsi_channels=HSI_CHANNELS,
+        log_path=(
+            output_directory
+            / "invalid_validation_pairs.txt"
+        ),
+        cache_path=VALIDATION_PAIR_VALIDATION_CACHE,
+    )
+
+    return train_pairs, validation_pairs
+
+
+def train_workflow(
+    device: torch.device,
+    use_amp: bool,
+    train_pairs: Sequence[Tuple[Path, Path]],
+    validation_pairs: Sequence[
+        Tuple[Path, Path]
+    ],
+    output_directory: Path,
+) -> MSTPlusPlusResidualBBDM:
+    if TRAIN_CROP_SIZE % MODEL_DOWNSAMPLE_FACTOR != 0:
+        raise ValueError(
+            f"TRAIN_CROP_SIZE={TRAIN_CROP_SIZE} must be divisible by "
+            f"{MODEL_DOWNSAMPLE_FACTOR}."
+        )
+
+    train_dataset = HSIRGBPairDataset(
+        pairs=train_pairs,
+        hsi_channels=HSI_CHANNELS,
+        crop_size=TRAIN_CROP_SIZE,
+        patches_per_image=PATCHES_PER_IMAGE,
+        training=True,
+        normalization=HSI_NORMALIZATION,
+        augment=USE_AUGMENTATION,
+    )
+    validation_dataset = HSIRGBPairDataset(
+        pairs=validation_pairs,
+        hsi_channels=HSI_CHANNELS,
+        crop_size=TRAIN_CROP_SIZE,
+        patches_per_image=1,
+        training=False,
+        normalization=HSI_NORMALIZATION,
+        augment=False,
+    )
+
+    train_loader = make_loader(
+        dataset=train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        drop_last=(
+            len(train_dataset) >= BATCH_SIZE
+        ),
+        device=device,
+    )
+    validation_loader = make_loader(
+        dataset=validation_dataset,
+        batch_size=VALIDATION_BATCH_SIZE,
         shuffle=False,
         drop_last=False,
-        **loader_options,
+        device=device,
     )
 
-    resume_data = None
-    bbdm_config = current_bbdm_config()
-    if RESUME_CHECKPOINT:
-        resume_path = Path(RESUME_CHECKPOINT)
-        if not resume_path.exists():
-            raise FileNotFoundError(f"Resume checkpoint does not exist: {resume_path}")
-        resume_data = load_checkpoint_file(resume_path, map_location="cpu")
-        bbdm_config = resume_data.get("bbdm_config", bbdm_config)
-
-    model = build_pipeline(device=device, bbdm_config=bbdm_config)
-    assert_mstpp_is_frozen(model)
+    model = build_residual_diffusion(
+        device=device,
+    )
 
     trainable_parameters = [
-        parameter for parameter in model.bridge.parameters() if parameter.requires_grad
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad
     ]
+
+    frozen_mst_parameters = sum(
+        parameter.numel()
+        for parameter in model.coarse_model.parameters()
+    )
+
+    print(
+        f"\nDevice: {device}\n"
+        f"Mixed precision: {use_amp}\n"
+        f"AMP dtype: {get_amp_dtype(device) if use_amp else 'float32'}\n"
+        f"Training pairs: {len(train_pairs)}\n"
+        f"Validation pairs: {len(validation_pairs)}\n"
+        f"Frozen MST++ parameters: {frozen_mst_parameters:,}\n"
+        f"Trainable residual parameters: "
+        f"{sum(p.numel() for p in trainable_parameters):,}"
+    )
+
     optimizer = torch.optim.AdamW(
         trainable_parameters,
         lr=LEARNING_RATE,
         weight_decay=WEIGHT_DECAY,
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=EPOCHS,
-        eta_min=MIN_LEARNING_RATE,
+
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=NUM_EPOCHS,
+            eta_min=MIN_LEARNING_RATE,
+        )
     )
-    scaler = torch.amp.GradScaler(
-        "cuda",
-        enabled=use_amp,
-        init_scale=AMP_INITIAL_SCALE,
+
+    amp_dtype = get_amp_dtype(device)
+
+    scaler = GradScaler(
+        enabled=(
+            use_amp
+            and amp_dtype == torch.float16
+        ),
+        init_scale=FP16_INITIAL_SCALE,
+        growth_interval=FP16_GROWTH_INTERVAL,
+    )
+
+    print(
+        f"GradScaler enabled: {scaler.is_enabled()} | "
+        f"initial scale: {float(scaler.get_scale()):.1f}"
     )
 
     start_epoch = 1
-    best_mrae = float("inf")
-    if resume_data is not None:
-        load_bridge_checkpoint(model, resume_data)
-        optimizer.load_state_dict(resume_data["optimizer_state_dict"])
-        scheduler.load_state_dict(resume_data["scheduler_state_dict"])
-        if "scaler_state_dict" in resume_data:
-            scaler.load_state_dict(resume_data["scaler_state_dict"])
-        start_epoch = int(resume_data["epoch"]) + 1
-        best_mrae = float(resume_data.get("best_mrae", best_mrae))
-        print(f"Resumed BBDM from epoch {start_epoch - 1}: {RESUME_CHECKPOINT}")
+    best_validation_residual_loss = float("inf")
 
-    output_dir = Path(OUTPUT_DIR)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if RESUME_CHECKPOINT is not None:
+        resume_checkpoint = (
+            _load_torch_checkpoint(
+                RESUME_CHECKPOINT,
+                device="cpu",
+            )
+        )
 
-    frozen_count = sum(parameter.numel() for parameter in model.coarse_model.parameters())
-    trainable_count = sum(parameter.numel() for parameter in trainable_parameters)
-    print(f"Device: {device} | AMP: {use_amp}")
-    print(f"Frozen MST++ checkpoint: {MSTPP_CHECKPOINT}")
-    print(f"Frozen MST++ parameters: {frozen_count:,}")
-    print(f"Trainable BBDM parameters: {trainable_count:,}")
-    print(f"Training pairs: {len(training_pairs)}")
-    print(f"Validation pairs: {len(validation_pairs)}")
-    print(f"Validation mode: {VALIDATION_MODE}")
-    print("Input mode: full resolution (no cropping or resizing)")
+        load_residual_diffusion_weights(
+            model,
+            resume_checkpoint,
+        )
 
-    for epoch in range(start_epoch, EPOCHS + 1):
-        print(f"\nEpoch {epoch:03d}/{EPOCHS:03d}")
+        optimizer.load_state_dict(
+            resume_checkpoint[
+                "optimizer_state_dict"
+            ]
+        )
+        scheduler.load_state_dict(
+            resume_checkpoint[
+                "scheduler_state_dict"
+            ]
+        )
 
-        training_metrics = train_one_epoch(
+        if OVERRIDE_RESUMED_LEARNING_RATE:
+            for parameter_group in optimizer.param_groups:
+                parameter_group["lr"] = LEARNING_RATE
+                parameter_group["initial_lr"] = LEARNING_RATE
+
+            scheduler.base_lrs = [
+                LEARNING_RATE
+                for _ in optimizer.param_groups
+            ]
+            scheduler._last_lr = [
+                LEARNING_RATE
+                for _ in optimizer.param_groups
+            ]
+
+            print(
+                "Overrode resumed learning rate with "
+                f"LEARNING_RATE={LEARNING_RATE:.2e}."
+            )
+
+        if (
+            LOAD_SCALER_STATE_ON_RESUME
+            and "scaler_state_dict" in resume_checkpoint
+        ):
+            scaler.load_state_dict(
+                resume_checkpoint[
+                    "scaler_state_dict"
+                ]
+            )
+        elif scaler.is_enabled():
+            print(
+                "Using a fresh, lower FP16 GradScaler state "
+                "instead of the checkpoint scaler state."
+            )
+
+        start_epoch = int(
+            resume_checkpoint.get(
+                "epoch",
+                0,
+            )
+        ) + 1
+
+        best_validation_residual_loss = float(
+            resume_checkpoint.get(
+                "best_validation_residual_loss",
+                float("inf"),
+            )
+        )
+
+        print(
+            f"\nResumed from {RESUME_CHECKPOINT} "
+            f"at epoch {start_epoch}."
+        )
+
+    for epoch in range(
+        start_epoch,
+        NUM_EPOCHS + 1,
+    ):
+        print(
+            f"\n{'=' * 80}\n"
+            f"Epoch {epoch}/{NUM_EPOCHS}\n"
+            f"{'=' * 80}"
+        )
+
+        train_metrics = train_one_epoch(
             model=model,
-            loader=training_loader,
+            loader=train_loader,
             optimizer=optimizer,
             scaler=scaler,
             device=device,
             use_amp=use_amp,
         )
-        validation_metrics = validate(
+
+        validation_diffusion = validate_diffusion_loss(
             model=model,
             loader=validation_loader,
             device=device,
             use_amp=use_amp,
         )
+
+        validation_reconstruction = (
+            validate_reconstruction_metrics(
+                model=model,
+                loader=validation_loader,
+                device=device,
+                use_amp=use_amp,
+                max_images=(
+                    VALIDATION_METRIC_MAX_IMAGES
+                ),
+            )
+        )
+
         scheduler.step()
 
-        print_bbdm_metrics("Train", training_metrics)
-        print_bbdm_metrics("Validation", validation_metrics)
-        print(f"Learning rate: {optimizer.param_groups[0]['lr']:.2e}")
+        current_learning_rate = (
+            optimizer.param_groups[0]["lr"]
+        )
 
-        improved = validation_metrics["mrae"] < best_mrae
-        if improved:
-            best_mrae = validation_metrics["mrae"]
+        print(
+            f"\nEpoch {epoch:03d}/{NUM_EPOCHS:03d} | "
+            f"LR={current_learning_rate:.2e} | "
+            f"train total={train_metrics['total_loss']:.6f} | "
+            f"train residual L1={train_metrics['residual_l1']:.6f} | "
+            f"skipped overflow batches="
+            f"{train_metrics['skipped_nonfinite_batches']} | "
+            f"validation residual L1="
+            f"{validation_diffusion['residual_l1']:.6f}"
+        )
+
+        if "one_step_psnr" in train_metrics:
+            print(
+                "Training one-step reconstruction metrics | "
+                f"MRAE={train_metrics['one_step_mrae']:.6f} | "
+                f"RMSE={train_metrics['one_step_rmse']:.6f} | "
+                f"SAM={train_metrics['one_step_sam']:.6f} rad | "
+                f"PSNR={train_metrics['one_step_psnr']:.4f} | "
+                f"SSIM={train_metrics['one_step_ssim']:.4f}"
+            )
+
+        print(
+            "Validation sampled refined metrics | "
+            f"images={validation_reconstruction['evaluated_images']} | "
+            f"steps={validation_reconstruction['sampling_steps']} | "
+            f"MRAE={validation_reconstruction['mrae']:.6f} | "
+            f"RMSE={validation_reconstruction['rmse']:.6f} | "
+            f"SAM={validation_reconstruction['sam']:.6f} rad | "
+            f"PSNR={validation_reconstruction['psnr']:.4f} | "
+            f"SSIM={validation_reconstruction['ssim']:.4f}"
+        )
+        print(
+            "Validation frozen MST++ metrics | "
+            f"MRAE={validation_reconstruction['mst_mrae']:.6f} | "
+            f"RMSE={validation_reconstruction['mst_rmse']:.6f} | "
+            f"SAM={validation_reconstruction['mst_sam']:.6f} rad | "
+            f"PSNR={validation_reconstruction['mst_psnr']:.4f} | "
+            f"SSIM={validation_reconstruction['mst_ssim']:.4f}"
+        )
+
+        print_timestep_tracker(
+            title="Training residual L1 by timestep",
+            result=train_metrics[
+                "timestep_losses"
+            ],
+        )
+        print_timestep_tracker(
+            title="Validation residual L1 by timestep",
+            result=validation_diffusion[
+                "timestep_losses"
+            ],
+        )
+
+        combined_validation_metrics = {
+            "diffusion": validation_diffusion,
+            "reconstruction": (
+                validation_reconstruction
+            ),
+        }
 
         save_checkpoint(
-            output_dir / "last_bbdm.pth",
-            model,
-            optimizer,
-            scheduler,
-            scaler,
-            epoch,
-            best_mrae,
+            output_path=(
+                output_directory
+                / "last_bbdm.pth"
+            ),
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            epoch=epoch,
+            best_validation_residual_loss=(
+                best_validation_residual_loss
+            ),
+            validation_metrics=(
+                combined_validation_metrics
+            ),
         )
-        if improved:
+
+        if (
+            validation_diffusion["residual_l1"]
+            < best_validation_residual_loss
+        ):
+            best_validation_residual_loss = (
+                validation_diffusion["residual_l1"]
+            )
+
             save_checkpoint(
-                output_dir / "best_bbdm.pth",
-                model,
-                optimizer,
-                scheduler,
-                scaler,
-                epoch,
-                best_mrae,
+                output_path=(
+                    output_directory
+                    / "best_bbdm.pth"
+                ),
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                epoch=epoch,
+                best_validation_residual_loss=(
+                    best_validation_residual_loss
+                ),
+                validation_metrics=(
+                    combined_validation_metrics
+                ),
             )
+
             print(
-                "Saved new best BBDM checkpoint with validation refined MRAE "
-                f"{best_mrae:.6f}"
+                "New best checkpoint | "
+                f"validation residual L1="
+                f"{best_validation_residual_loss:.6f}"
             )
 
+    return model
 
-# ============================================================
-# Full-resolution BBDM inference
-# ============================================================
 
-@torch.no_grad()
-def infer() -> None:
-    device = get_device()
-    use_amp = USE_AMP and device.type == "cuda"
+def load_model_for_inference(
+    checkpoint_path: str,
+    device: torch.device,
+) -> MSTPlusPlusResidualBBDM:
+    checkpoint = _load_torch_checkpoint(
+        checkpoint_path,
+        device="cpu",
+    )
 
-    bbdm_checkpoint_path = Path(INFERENCE_BBDM_CHECKPOINT)
-    rgb_path = Path(INFERENCE_RGB_PATH)
-    if not bbdm_checkpoint_path.exists():
-        raise FileNotFoundError(
-            f"BBDM inference checkpoint does not exist: {bbdm_checkpoint_path}"
-        )
-    if not rgb_path.exists():
-        raise FileNotFoundError(f"Inference RGB image does not exist: {rgb_path}")
+    model_config = (
+        checkpoint.get("model_config", {})
+        if isinstance(checkpoint, dict)
+        else {}
+    )
 
-    checkpoint = load_checkpoint_file(bbdm_checkpoint_path, map_location="cpu")
-    model = build_pipeline(
+    model = build_residual_diffusion(
         device=device,
-        bbdm_config=checkpoint.get("bbdm_config", current_bbdm_config()),
+        model_config=model_config,
     )
-    load_bridge_checkpoint(model, checkpoint)
+
+    load_residual_diffusion_weights(
+        model,
+        checkpoint,
+    )
+
     model.eval()
-    assert_mstpp_is_frozen(model)
-
-    rgb = torch.from_numpy(load_rgb(rgb_path)).unsqueeze(0).to(device)
-    with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-        coarse_hsi, refined_hsi = model.reconstruct(
-            rgb=rgb,
-            clip_denoised=CLAMP_INFERENCE_OUTPUT,
-            stochastic=INFERENCE_STOCHASTIC,
-        )
-
-    coarse_hsi = coarse_hsi.float()
-    refined_hsi = refined_hsi.float()
-    predicted_residual = refined_hsi - coarse_hsi
-
-    save_dir = Path(INFERENCE_OUTPUT_DIR)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    stem = rgb_path.stem
-
-    outputs = {
-        "coarse": coarse_hsi[0].cpu().numpy(),
-        "refined": refined_hsi[0].cpu().numpy(),
-        "predicted_residual": predicted_residual[0].cpu().numpy(),
-    }
-    for name, array_chw in outputs.items():
-        np.save(save_dir / f"{stem}_{name}.npy", array_chw)
-        sio.savemat(
-            save_dir / f"{stem}_{name}.mat",
-            {HSI_KEY: array_chw.transpose(1, 2, 0)},
-        )
-    print(f"Coarse, refined, and residual predictions saved to: {save_dir}")
-
-    if INFERENCE_HSI_PATH is None or str(INFERENCE_HSI_PATH).strip() == "":
-        print("INFERENCE_HSI_PATH is not set; metrics and heatmaps were skipped")
-        return
-
-    target_path = Path(INFERENCE_HSI_PATH)
-    if not target_path.exists():
-        raise FileNotFoundError(
-            f"Inference ground-truth HSI does not exist: {target_path}"
-        )
-    target = torch.from_numpy(normalize_hsi(load_hsi(target_path))).unsqueeze(0).to(device)
-    if refined_hsi.shape != target.shape:
-        raise ValueError(
-            "Prediction and ground truth have different shapes: "
-            f"prediction={tuple(refined_hsi.shape)}, target={tuple(target.shape)}"
-        )
-
-    coarse_metrics = calculate_metrics(coarse_hsi, target)
-    refined_metrics = calculate_metrics(refined_hsi, target)
-    print(
-        "Coarse MST++ | "
-        f"MRAE: {coarse_metrics['mrae']:.6f} | "
-        f"RMSE: {coarse_metrics['rmse']:.6f} | "
-        f"SAM: {coarse_metrics['sam']:.6f} | "
-        f"PSNR: {coarse_metrics['psnr']:.4f} | "
-        f"SSIM: {coarse_metrics['ssim']:.4f}"
-    )
-    print(
-        "Refined BBDM | "
-        f"MRAE: {refined_metrics['mrae']:.6f} | "
-        f"RMSE: {refined_metrics['rmse']:.6f} | "
-        f"SAM: {refined_metrics['sam']:.6f} | "
-        f"PSNR: {refined_metrics['psnr']:.4f} | "
-        f"SSIM: {refined_metrics['ssim']:.4f}"
-    )
-
-    heatmap_module = ResidualHeatmap(HEATMAP_REDUCTION).to(device)
-    for name, prediction in (("coarse", coarse_hsi), ("refined", refined_hsi)):
-        heatmap = heatmap_module(prediction, target)
-        png_path = save_dir / f"{stem}_{name}_{HEATMAP_REDUCTION}_heatmap.png"
-        npy_path = save_dir / f"{stem}_{name}_{HEATMAP_REDUCTION}_heatmap.npy"
-        save_heatmap(
-            heatmap,
-            png_path,
-            f"{name.capitalize()} {HEATMAP_REDUCTION.upper()} spectral residual: {stem}",
-        )
-        np.save(npy_path, heatmap[0, 0].cpu().numpy())
+    return model
 
 
-# ============================================================
-# Parser: --mode is deliberately the only parser argument
-# ============================================================
-
-def parse_mode() -> str:
+def parse_command_line_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        "Frozen MST++ with residual Brownian-bridge training and inference"
+        description=(
+            "Train or evaluate the frozen-MST++ residual Brownian-bridge model."
+        )
     )
     parser.add_argument(
-        "--mode",
-        choices=["train", "infer"],
-        required=True,
-        help="Run BBDM training or full reverse-bridge inference",
+        "--visualize",
+        action="store_true",
+        help=(
+            "Save RGB/ground-truth/MST++/refined preview images. "
+            "In train mode this also runs random validation inference "
+            "after training using the best checkpoint."
+        ),
     )
-    return parser.parse_args().mode
+    parser.add_argument(
+        "--visualization-images",
+        type=int,
+        default=NUM_RANDOM_INFERENCE_IMAGES,
+        help=(
+            "Number of random validation images used for final inference "
+            "and optional visualization."
+        ),
+    )
+
+    arguments = parser.parse_args()
+
+    if arguments.visualization_images < 1:
+        parser.error(
+            "--visualization-images must be at least 1."
+        )
+
+    return arguments
 
 
 def main() -> None:
-    mode = parse_mode()
-    if mode == "train":
-        train()
+    arguments = parse_command_line_arguments()
+    set_seed(SEED)
+
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+    use_amp = (
+        USE_AMP
+        and device.type == "cuda"
+    )
+
+    output_directory = Path(OUTPUT_DIR)
+    output_directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    if RUN_MODE not in {
+        "train",
+        "infer",
+        "train_and_infer",
+    }:
+        raise ValueError(
+            "RUN_MODE must be 'train', 'infer', "
+            "or 'train_and_infer'."
+        )
+
+    if RUN_MODE in {
+        "train",
+        "train_and_infer",
+    }:
+        train_pairs, validation_pairs = (
+            prepare_pairs(output_directory)
+        )
+        model = train_workflow(
+            device=device,
+            use_amp=use_amp,
+            train_pairs=train_pairs,
+            validation_pairs=validation_pairs,
+            output_directory=output_directory,
+        )
     else:
-        infer()
+        validation_pairs = pair_hsi_rgb_files(
+            hsi_directory=VALIDATION_HSI_DIR,
+            rgb_directory=VALIDATION_RGB_DIR,
+        )
+        validation_pairs = filter_valid_pairs(
+            pairs=validation_pairs,
+            hsi_channels=HSI_CHANNELS,
+            log_path=(
+                output_directory
+                / "invalid_validation_pairs.txt"
+            ),
+            cache_path=VALIDATION_PAIR_VALIDATION_CACHE,
+        )
+
+        model = load_model_for_inference(
+            checkpoint_path=INFERENCE_CHECKPOINT,
+            device=device,
+        )
+
+    should_run_final_inference = (
+        RUN_MODE in {
+            "infer",
+            "train_and_infer",
+        }
+        or arguments.visualize
+    )
+
+    if should_run_final_inference:
+        # After training, use the saved best checkpoint rather than the final
+        # epoch's in-memory weights.
+        if RUN_MODE in {
+            "train",
+            "train_and_infer",
+        }:
+            model = load_model_for_inference(
+                checkpoint_path=str(
+                    output_directory
+                    / "best_bbdm.pth"
+                ),
+                device=device,
+            )
+
+        run_random_validation_inference(
+            model=model,
+            validation_pairs=validation_pairs,
+            device=device,
+            use_amp=use_amp,
+            output_directory=Path(
+                INFERENCE_OUTPUT_DIR
+            ),
+            number_of_images=(
+                arguments.visualization_images
+            ),
+            save_visualizations=(
+                arguments.visualize
+            ),
+        )
 
 
 if __name__ == "__main__":
