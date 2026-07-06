@@ -1,21 +1,21 @@
-"""Parser-free visualisation for selected I2SB RGB -> HSI samples.
+"""Visualize selected validation reconstructions from a trained I2SB RGB -> HSI model.
 
-What this script does
----------------------
-1. Recreates the same deterministic validation split used during training.
-2. Selects only the requested validation images by file stem or dataset index.
-   When neither is supplied, it randomly selects a small number of images.
-3. Loads only those selected native-resolution RGB/HSI pairs.
-4. Corrects a transposed HSI orientation when necessary.
-5. Runs the frozen MST++ coarse prediction and the complete multi-step I2SB
-   reverse process only for the selected images.
-6. Saves a visualisation containing, for each selected image:
-      RGB input | GT pseudo-RGB | MST++ pseudo-RGB | I2SB pseudo-RGB |
-      I2SB spectral-MAE map | spectrum at the highest-error pixel
-7. Optionally saves the selected ground-truth, coarse, and refined HSI cubes.
+This parser-free script:
+    1. Recreates exactly the same deterministic validation split used during
+       training.
+    2. Selects only a small number of images from that validation split.
+    3. Runs the complete RGB -> frozen MST++ -> I2SB reverse-sampling pipeline
+       at the full native image resolution.
+    4. Creates a separate 2 x 2 visualization for every selected image:
+           - Ground-truth HSI pseudo-RGB
+           - Full I2SB reconstruction pseudo-RGB
+           - Mean absolute error over spectral bands
+           - Ground-truth and reconstructed spectra at three spatial locations
+    5. Displays the figures and optionally saves them and their HSI cubes.
 
-No whole-dataset evaluation, aggregate metric report, CSV, or JSON is produced.
-There is intentionally no argparse parser. Edit the Configuration section.
+No whole-dataset evaluation or aggregate metric report is performed.
+Per-image metrics are calculated only for the figure title and console output.
+There is no argparse parser; edit the Configuration section directly.
 """
 
 from __future__ import annotations
@@ -73,9 +73,8 @@ RGB_CHANNELS = 3
 SUPPORTED_HSI_EXTENSIONS = {".mat", ".npy", ".npz", ".pt", ".pth"}
 SUPPORTED_RGB_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".npy"}
 
-# Must match training when recreating its validation split. Set this to False
-# only when the intended visualisation pool is the complete paired dataset.
-USE_VALIDATION_SPLIT = True
+# These values must exactly match training so the same deterministic
+# validation split is reconstructed. Inference is restricted to this split.
 VALIDATION_FRACTION = 0.10
 SEED = 42
 
@@ -95,8 +94,8 @@ SELECTED_IMAGE_STEMS: list[str] = [
     # "ARAD_1K_0052",
 ]
 
-# Indices refer to the deterministic validation pool after split_pairs() when
-# USE_VALIDATION_SPLIT=True, otherwise to the sorted complete paired dataset.
+# Indices refer only to the deterministic validation split returned by
+# split_pairs(). Training-split and complete-dataset indices are not accepted.
 SELECTED_DATASET_INDICES: list[int] = []
 
 # Used only when both lists above are empty.
@@ -144,6 +143,18 @@ WAVELENGTH_END_NM = 700.0
 # R ~= 640 nm, G ~= 550 nm, B ~= 460 nm.
 DISPLAY_RGB_BAND_INDICES = (24, 15, 6)
 DISPLAY_PERCENTILES = (1.0, 99.0)
+
+# Relative (y, x) positions used for the three spectral signature comparisons.
+# These match the visualization style in the supplied VAE script.
+SPECTRAL_LOCATIONS = (
+    (0.25, 0.25),
+    (0.50, 0.50),
+    (0.75, 0.75),
+)
+
+SAVE_FIGURES = True
+SHOW_FIGURES = True
+FIGURE_DPI = 180
 
 
 # =============================================================================
@@ -818,117 +829,143 @@ def select_highest_error_pixel(
 
 
 def create_visualisation_figure(
-    samples: Sequence[Mapping[str, Any]],
-    output_path: Path,
-) -> None:
-    if not samples:
-        raise ValueError("No visualisation samples were provided.")
+    sample: Mapping[str, Any],
+    output_dir: Path,
+) -> Path | None:
+    """Create one VAE-style 2 x 2 figure for a selected validation sample.
 
+    The reconstruction uses the ground-truth percentile limits for pseudo-RGB
+    conversion, so differences are not hidden by separate contrast stretching.
+    """
+    target = np.asarray(sample["target"], dtype=np.float32)
+    refined = np.asarray(sample["refined"], dtype=np.float32)
+    stem = str(sample["stem"])
+    metrics = sample["refined_metrics"]
+
+    if target.shape != refined.shape:
+        raise ValueError(
+            f"Cannot visualize {stem}: target shape {target.shape} and "
+            f"reconstruction shape {refined.shape} differ."
+        )
+
+    lows, highs = derive_display_limits(target)
+    target_rgb = hsi_to_pseudo_rgb(target, lows, highs)
+    refined_rgb = hsi_to_pseudo_rgb(refined, lows, highs)
+    error_map = np.mean(np.abs(refined - target), axis=0)
+
+    figure, axes = plt.subplots(
+        2,
+        2,
+        figsize=(13, 10),
+    )
+
+    axes[0, 0].imshow(target_rgb)
+    axes[0, 0].set_title("Ground-truth HSI pseudo-RGB")
+    axes[0, 0].axis("off")
+
+    axes[0, 1].imshow(refined_rgb)
+    axes[0, 1].set_title("I2SB reconstruction pseudo-RGB")
+    axes[0, 1].axis("off")
+
+    error_vmax = max(float(np.percentile(error_map, 99.0)), 1e-8)
+    error_image = axes[1, 0].imshow(
+        error_map,
+        cmap="magma",
+        vmin=0.0,
+        vmax=error_vmax,
+    )
+    axes[1, 0].set_title("Mean absolute error over spectral bands")
+    axes[1, 0].axis("off")
+    figure.colorbar(
+        error_image,
+        ax=axes[1, 0],
+        fraction=0.046,
+        pad=0.04,
+    )
+
+    height, width = target.shape[1:]
     wavelengths = np.linspace(
         WAVELENGTH_START_NM,
         WAVELENGTH_END_NM,
-        HSI_CHANNELS,
+        target.shape[0],
         dtype=np.float32,
     )
 
-    figure, axes = plt.subplots(
-        nrows=len(samples),
-        ncols=6,
-        figsize=(24, 4.7 * len(samples)),
-        constrained_layout=True,
-    )
-    if len(samples) == 1:
-        axes = np.expand_dims(axes, axis=0)
+    for point_index, (relative_y, relative_x) in enumerate(
+        SPECTRAL_LOCATIONS,
+        start=1,
+    ):
+        y = int(round(relative_y * (height - 1)))
+        x = int(round(relative_x * (width - 1)))
 
-    for row_index, sample in enumerate(samples):
-        rgb = sample["rgb"]
-        target = sample["target"]
-        coarse = sample["coarse"]
-        refined = sample["refined"]
-        stem = sample["stem"]
-
-        lows, highs = derive_display_limits(target)
-        target_rgb = hsi_to_pseudo_rgb(target, lows, highs)
-        coarse_rgb = hsi_to_pseudo_rgb(coarse, lows, highs)
-        refined_rgb = hsi_to_pseudo_rgb(refined, lows, highs)
-        error_row, error_col, error_map = select_highest_error_pixel(refined, target)
-
-        rgb_display = np.clip(np.transpose(rgb, (1, 2, 0)), 0.0, 1.0)
-
-        axes[row_index, 0].imshow(rgb_display)
-        axes[row_index, 0].set_title(f"{stem}\nRGB input")
-
-        axes[row_index, 1].imshow(target_rgb)
-        axes[row_index, 1].set_title("Ground-truth pseudo-RGB")
-
-        axes[row_index, 2].imshow(coarse_rgb)
-        axes[row_index, 2].set_title(
-            "MST++ coarse\n"
-            f"MRAE {sample['coarse_metrics']['mrae']:.4f}, "
-            f"PSNR {sample['coarse_metrics']['psnr']:.2f}"
-        )
-
-        axes[row_index, 3].imshow(refined_rgb)
-        axes[row_index, 3].set_title(
-            "I2SB refined\n"
-            f"MRAE {sample['refined_metrics']['mrae']:.4f}, "
-            f"PSNR {sample['refined_metrics']['psnr']:.2f}"
-        )
-
-        error_vmax = float(np.percentile(error_map, 99.0))
-        error_vmax = max(error_vmax, 1e-8)
-        error_image = axes[row_index, 4].imshow(
-            error_map,
-            cmap="inferno",
-            vmin=0.0,
-            vmax=error_vmax,
-        )
-        axes[row_index, 4].scatter(
-            [error_col],
-            [error_row],
-            marker="x",
-            s=55,
-            linewidths=1.5,
-            c="cyan",
-        )
-        axes[row_index, 4].set_title("I2SB mean absolute spectral error")
-        figure.colorbar(error_image, ax=axes[row_index, 4], fraction=0.046, pad=0.04)
-
-        axes[row_index, 5].plot(
+        target_line = axes[1, 1].plot(
             wavelengths,
-            target[:, error_row, error_col],
-            label="Ground truth",
+            target[:, y, x],
             linewidth=2.0,
-        )
-        axes[row_index, 5].plot(
-            wavelengths,
-            coarse[:, error_row, error_col],
-            label="MST++",
-            linewidth=1.5,
-        )
-        axes[row_index, 5].plot(
-            wavelengths,
-            refined[:, error_row, error_col],
-            label="I2SB",
-            linewidth=1.5,
-        )
-        axes[row_index, 5].set_title(
-            f"Spectrum at highest-error pixel ({error_row}, {error_col})"
-        )
-        axes[row_index, 5].set_xlabel("Wavelength (nm)")
-        axes[row_index, 5].set_ylabel("Intensity")
-        axes[row_index, 5].grid(alpha=0.25)
-        axes[row_index, 5].legend(fontsize=8)
+            label=f"GT P{point_index} ({y},{x})",
+        )[0]
 
-        for col_index in range(5):
-            axes[row_index, col_index].axis("off")
+        axes[1, 1].plot(
+            wavelengths,
+            refined[:, y, x],
+            linestyle="--",
+            linewidth=2.0,
+            color=target_line.get_color(),
+            label=f"I2SB P{point_index}",
+        )
+
+        for image_axis in (axes[0, 0], axes[0, 1]):
+            image_axis.scatter(
+                [x],
+                [y],
+                s=35,
+                marker="o",
+                facecolors="none",
+                edgecolors=target_line.get_color(),
+                linewidths=1.5,
+            )
+            image_axis.text(
+                x + 5,
+                y + 5,
+                f"P{point_index}",
+                color=target_line.get_color(),
+                fontsize=8,
+                weight="bold",
+            )
+
+    axes[1, 1].set_title("Spectral signatures")
+    axes[1, 1].set_xlabel("Wavelength (nm)")
+    axes[1, 1].set_ylabel("Intensity")
+    axes[1, 1].grid(alpha=0.3)
+    axes[1, 1].legend(fontsize=8, ncol=2)
 
     figure.suptitle(
-        "Selected RGB-to-HSI samples: MST++ boundary vs full I2SB reverse sample",
-        fontsize=16,
+        f"{stem}\n"
+        f"MRAE: {metrics['mrae']:.6f} | "
+        f"RMSE: {metrics['rmse']:.6f} | "
+        f"PSNR: {metrics['psnr']:.3f} dB | "
+        f"SAM: {metrics['sam']:.3f} | "
+        f"SSIM: {metrics['ssim']:.4f}",
+        fontsize=13,
     )
-    figure.savefig(output_path, dpi=180, bbox_inches="tight")
+    figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.93))
+
+    saved_path: Path | None = None
+    if SAVE_FIGURES:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        saved_path = output_dir / f"{stem}_i2sb_reconstruction.png"
+        figure.savefig(
+            saved_path,
+            dpi=FIGURE_DPI,
+            bbox_inches="tight",
+        )
+        print(f"Saved visualization: {saved_path}")
+
+    if SHOW_FIGURES:
+        plt.show()
+
     plt.close(figure)
+    return saved_path
 
 
 # =============================================================================
@@ -939,7 +976,12 @@ def create_visualisation_figure(
 def choose_visualisation_pairs(
     pairs: Sequence[Tuple[Path, Path]],
 ) -> List[Tuple[int, Path, Path]]:
-    """Return only the explicitly selected pairs, preserving requested order."""
+    """Select pairs only from the reconstructed validation split.
+
+    The caller must pass validation_pairs, never all_pairs or training_pairs.
+    Requested stems that are not members of validation raise an error instead
+    of silently falling back to another dataset partition.
+    """
     if not pairs:
         raise RuntimeError("The visualisation pool is empty.")
 
@@ -960,8 +1002,8 @@ def choose_visualisation_pairs(
         if missing:
             available_examples = sorted(by_stem)[:10]
             raise KeyError(
-                "The following selected stems were not found in the chosen "
-                f"dataset pool: {missing}. Available examples: {available_examples}"
+                "The following selected stems are not members of the validation "
+                f"split: {missing}. Validation examples: {available_examples}"
             )
         return [by_stem[stem] for stem in SELECTED_IMAGE_STEMS]
 
@@ -1141,14 +1183,16 @@ def main() -> None:
         raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
 
     all_pairs = find_paired_files(HSI_DATA_DIR, RGB_DATA_DIR)
-    if USE_VALIDATION_SPLIT:
-        _training_pairs, visualisation_pool = split_pairs(
-            all_pairs, validation_fraction=VALIDATION_FRACTION, seed=SEED
-        )
-        pool_name = "deterministic validation split"
-    else:
-        visualisation_pool = all_pairs
-        pool_name = "complete paired dataset"
+
+    # Always reconstruct the exact deterministic validation split used during
+    # training. No image from the training split can enter the inference pool.
+    _training_pairs, validation_pairs = split_pairs(
+        all_pairs,
+        validation_fraction=VALIDATION_FRACTION,
+        seed=SEED,
+    )
+    visualisation_pool = validation_pairs
+    pool_name = "deterministic validation split"
 
     selected_pairs = choose_visualisation_pairs(visualisation_pool)
 
@@ -1168,6 +1212,7 @@ def main() -> None:
     print(f"  Device: {device}")
     print(f"  Mixed precision: {use_amp}")
     print(f"  Selection pool: {pool_name} ({len(visualisation_pool)} images)")
+    print("  Inference outside the validation split: disabled")
     print(f"  Selected images: {len(selected_pairs)}")
     print(f"  Sampling steps: {NUM_SAMPLING_STEPS}")
     print(f"  Tiled reverse sampling: {USE_TILED_REVERSE}")
@@ -1187,13 +1232,21 @@ def main() -> None:
         use_amp=use_amp,
     )
 
-    figure_path = OUTPUT_DIR / "selected_i2sb_visualisations.png"
-    create_visualisation_figure(samples, figure_path)
+    figure_paths: List[Path] = []
+    for sample in samples:
+        saved_path = create_visualisation_figure(
+            sample=sample,
+            output_dir=OUTPUT_DIR,
+        )
+        if saved_path is not None:
+            figure_paths.append(saved_path)
 
-    print("\nSaved outputs")
-    print(f"  Visualisation: {figure_path}")
+    print("\nCompleted visualisations")
+    print(f"  Images visualised: {len(samples)}")
+    if figure_paths:
+        print(f"  Figure directory: {OUTPUT_DIR.resolve()}")
     if SAVE_VISUALISED_CUBES:
-        print(f"  Selected cubes: {OUTPUT_DIR / 'visualised_cubes'}")
+        print(f"  Selected cubes: {(OUTPUT_DIR / 'visualised_cubes').resolve()}")
 
 
 if __name__ == "__main__":
