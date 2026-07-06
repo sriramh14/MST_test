@@ -58,7 +58,7 @@ RGB_DATA_DIR = (
 # Prefer the final checkpoint when it exists because it contains the model from
 # the final epoch. Change this to best_i2sb.pth to inspect the best quick-MRAE
 # checkpoint instead.
-CHECKPOINT_PATH = "./i2sb_checkpoints/final_i2sb_with_full_sampling.pth"
+CHECKPOINT_PATH = "./i2sb_checkpoints/best_i2sb.pth"
 
 # Only needed when CHECKPOINT_PATH does not contain the frozen MST++ weights.
 # Checkpoints produced by the supplied training script save model.state_dict(),
