@@ -275,6 +275,10 @@ class MSTResidualDiffusion(nn.Module):
                 strict=strict_checkpoint,
             )
 
+        # MST++ is frozen and intentionally kept in float32. Some MST++
+        # depthwise convolutions do not have a usable CUDA kernel under
+        # FP16/BF16 autocast on every GPU/cuDNN combination.
+        self.mst_model.float()
         for parameter in self.mst_model.parameters():
             parameter.requires_grad = False
         self.mst_model.eval()
@@ -315,8 +319,23 @@ class MSTResidualDiffusion(nn.Module):
 
     @torch.no_grad()
     def get_mst_prediction(self, rgb: torch.Tensor) -> torch.Tensor:
-        prediction = self._extract_mst_output(self.mst_model(rgb))
-        return prediction.detach()
+        """Run frozen MST++ in float32, independently of outer AMP autocast."""
+        self.mst_model.eval()
+
+        # The training loop may wrap the complete residual model in FP16/BF16
+        # autocast. Override that context for MST++, because its depthwise
+        # positional convolutions can fail with:
+        # "GET was unable to find an engine to execute this computation".
+        with torch.autocast(
+            device_type=rgb.device.type,
+            enabled=False,
+        ):
+            mst_input = rgb.detach().to(dtype=torch.float32).contiguous()
+            prediction = self._extract_mst_output(
+                self.mst_model(mst_input)
+            )
+
+        return prediction.detach().float().contiguous()
 
     def _beta_at(
         self,
