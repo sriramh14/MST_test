@@ -36,10 +36,10 @@ from torch.utils.data import DataLoader, Dataset
 # ============================================================================
 # Project imports
 # ============================================================================
-# Adjust only these import paths if your project layout is different.
-# Adjust these paths/classes to match your project layout.
-from model.MST_Plus_Plus import MST_Plus_Plus
-from model.RBBDM_rgb2hsi import (
+# Adjust only this import path if your project layout is different.
+# RBBDM_rgb2hsi imports MST and MST_Plus_Plus internally from the existing
+# MST++ architecture file.
+from model.BBDM_from_mstpp import (
     MSTResidualDenoiser,
     ResidualBBDM,
     MSTPlusPlusResidualBBDM,
@@ -81,7 +81,7 @@ VALIDATION_RGB_DIR = (
 MST_CHECKPOINT = "./mst_checkpoints/mst_plus_plus.pth"
 OUTPUT_DIR = "./mst_bbdm_checkpoints"
 
-# Add constructor arguments required by your MST++ implementation here.
+# These arguments are forwarded to the internally imported MST_Plus_Plus.
 MST_MODEL_KWARGS: Dict[str, Any] = {}
 STRICT_MST_CHECKPOINT = True
 
@@ -1446,30 +1446,6 @@ def default_model_config() -> dict:
     }
 
 
-def _load_mst_weights(
-    coarse_model: torch.nn.Module,
-) -> None:
-    checkpoint = _load_torch_checkpoint(
-        MST_CHECKPOINT,
-        device="cpu",
-    )
-
-    state_dict = _extract_state_dict(
-        checkpoint,
-        candidate_keys=(
-            "model_state_dict",
-            "mst_state_dict",
-            "state_dict",
-            "model",
-        ),
-    )
-
-    coarse_model.load_state_dict(
-        state_dict,
-        strict=STRICT_MST_CHECKPOINT,
-    )
-
-
 def build_residual_diffusion(
     device: torch.device,
     model_config: Optional[dict] = None,
@@ -1480,12 +1456,6 @@ def build_residual_diffusion(
         for key in config:
             if key in model_config:
                 config[key] = model_config[key]
-
-    coarse_model = MST_Plus_Plus(
-        **MST_MODEL_KWARGS
-    )
-    _load_mst_weights(coarse_model)
-    coarse_model.float()
 
     denoiser = MSTResidualDenoiser(
         hsi_channels=config["hsi_channels"],
@@ -1502,10 +1472,15 @@ def build_residual_diffusion(
         midpoint_variance=config["midpoint_variance"],
     )
 
+    # The model wrapper now creates MST_Plus_Plus internally from the import
+    # in RBBDM_rgb2hsi.py and loads the pretrained coarse checkpoint itself.
     model = MSTPlusPlusResidualBBDM(
-        coarse_model=coarse_model,
         bridge=bridge,
+        coarse_model=None,
+        coarse_checkpoint=MST_CHECKPOINT,
+        coarse_model_kwargs=MST_MODEL_KWARGS,
         freeze_coarse_model=True,
+        strict_checkpoint_loading=STRICT_MST_CHECKPOINT,
     )
 
     return model.to(device)
@@ -1600,19 +1575,13 @@ def get_coarse_prediction_fp32(
     model: MSTPlusPlusResidualBBDM,
     rgb: torch.Tensor,
 ) -> torch.Tensor:
-    """Run frozen MST++ in FP32 outside the surrounding AMP context."""
-    model.coarse_model.eval()
+    """
+    Use the model wrapper's frozen FP32 MST++ inference method.
 
-    with torch.autocast(
-        device_type=rgb.device.type,
-        enabled=False,
-    ):
-        output = model.coarse_model(
-            rgb.detach().float().contiguous()
-        )
-        coarse_hsi = _extract_tensor_output(output)
-
-    return coarse_hsi.detach().float().contiguous()
+    RBBDM_rgb2hsi.py is responsible for disabling autocast, keeping MST++
+    frozen, extracting common output formats, and cropping internal padding.
+    """
+    return model.get_coarse(rgb)
 
 
 # ============================================================================
