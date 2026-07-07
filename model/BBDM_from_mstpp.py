@@ -1,834 +1,1257 @@
+"""
+Self-contained MST++ -> Brownian Bridge model for RGB-to-HSI reconstruction.
+
+The Brownian-bridge schedule, objectives, training loss, and reverse sampler are
+kept equivalent to the supplied BBDM BrownianBridgeModel. The external BBDM
+UNet/util imports are replaced by self-contained implementations inspired by
+the official xuekt98/BBDM repository.
+
+Expected data:
+    rgb          : [B, 3, H, W]
+    ground_truth : [B, hsi_channels, H, W]
+
+Bridge endpoints:
+    x0 = ground-truth HSI
+    y  = frozen MST++ coarse HSI estimate
+
+Edit the MST++ import below to match your project.
+"""
+
 from __future__ import annotations
 
 import math
+from abc import abstractmethod
+from functools import partial
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm.autonotebook import tqdm
 
 
-# Adjust this import path to match your project structure.
-from model.MST_Plus_Plus import MST, MST_Plus_Plus
+# ---------------------------------------------------------------------------
+# EDIT THIS IMPORT TO MATCH YOUR MST++ IMPLEMENTATION.
+# Example:
+# from model.mst_plus_plus import MST_Plus_Plus
+# ---------------------------------------------------------------------------
+try:
+    from .MST_Plus_Plus import MST_Plus_Plus  # type: ignore
+except ImportError:
+    MST_Plus_Plus = None
 
 
-# ============================================================================
-# Checkpoint helpers
-# ============================================================================
+# ===========================================================================
+# Basic utilities
+# ===========================================================================
 
-def _load_checkpoint(path: str | Path) -> Any:
-    try:
-        return torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location="cpu")
+def exists(value: Any) -> bool:
+    return value is not None
 
 
-def _strip_prefix(
-    state_dict: dict[str, torch.Tensor],
-    prefix: str,
-) -> dict[str, torch.Tensor]:
-    if state_dict and all(key.startswith(prefix) for key in state_dict):
-        return {
-            key[len(prefix):]: value
-            for key, value in state_dict.items()
-        }
-    return state_dict
+def default(value: Any, default_value: Union[Any, Callable[[], Any]]) -> Any:
+    if exists(value):
+        return value
+    return default_value() if callable(default_value) else default_value
 
 
-def _extract_state_dict(checkpoint: Any) -> dict[str, torch.Tensor]:
-    if not isinstance(checkpoint, dict):
-        raise TypeError(
-            f"Unsupported checkpoint type: {type(checkpoint)}"
+def extract(a: torch.Tensor, t: torch.Tensor, x_shape: Sequence[int]) -> torch.Tensor:
+    """Gather one schedule value per batch item and reshape for broadcasting."""
+    batch_size = t.shape[0]
+    out = a.gather(0, t)
+    return out.reshape(batch_size, *((1,) * (len(x_shape) - 1)))
+
+
+def conv_nd(dims: int, *args: Any, **kwargs: Any) -> nn.Module:
+    if dims == 1:
+        return nn.Conv1d(*args, **kwargs)
+    if dims == 2:
+        return nn.Conv2d(*args, **kwargs)
+    if dims == 3:
+        return nn.Conv3d(*args, **kwargs)
+    raise ValueError(f"Unsupported convolution dimensionality: {dims}")
+
+
+def avg_pool_nd(dims: int, *args: Any, **kwargs: Any) -> nn.Module:
+    if dims == 1:
+        return nn.AvgPool1d(*args, **kwargs)
+    if dims == 2:
+        return nn.AvgPool2d(*args, **kwargs)
+    if dims == 3:
+        return nn.AvgPool3d(*args, **kwargs)
+    raise ValueError(f"Unsupported pooling dimensionality: {dims}")
+
+
+def linear(*args: Any, **kwargs: Any) -> nn.Module:
+    return nn.Linear(*args, **kwargs)
+
+
+def zero_module(module: nn.Module) -> nn.Module:
+    for parameter in module.parameters():
+        parameter.detach().zero_()
+    return module
+
+
+def timestep_embedding(
+    timesteps: torch.Tensor,
+    dim: int,
+    max_period: int = 10_000,
+) -> torch.Tensor:
+    """Sinusoidal timestep embedding used by the original guided-diffusion UNet."""
+    half = dim // 2
+    frequencies = torch.exp(
+        -math.log(max_period)
+        * torch.arange(0, half, dtype=torch.float32, device=timesteps.device)
+        / max(half, 1)
+    )
+    arguments = timesteps[:, None].float() * frequencies[None]
+    embedding = torch.cat([torch.cos(arguments), torch.sin(arguments)], dim=-1)
+    if dim % 2:
+        embedding = torch.cat(
+            [embedding, torch.zeros_like(embedding[:, :1])],
+            dim=-1,
         )
+    return embedding
 
-    state_dict = None
 
-    for key in (
-        "model_state_dict",
-        "state_dict",
-        "mst_state_dict",
-        "mst_model_state_dict",
-        "model",
-        "params",
-    ):
-        value = checkpoint.get(key)
-        if (
-            isinstance(value, dict)
-            and value
-            and all(torch.is_tensor(item) for item in value.values())
-        ):
-            state_dict = value
-            break
+class ChannelLayerNorm(nn.Module):
+    """
+    LayerNorm over channels for NCHW/NCDHW feature maps.
 
-    if state_dict is None:
-        if (
-            checkpoint
-            and all(torch.is_tensor(item) for item in checkpoint.values())
-        ):
-            state_dict = checkpoint
-        else:
-            raise KeyError(
-                "Could not find an MST++ state_dict in the checkpoint."
+    This deliberately uses torch.nn.LayerNorm, as requested, rather than the
+    GroupNorm layer used in the original OpenAI/BBDM implementation.
+    """
+
+    def __init__(self, channels: int, eps: float = 1e-6):
+        super().__init__()
+        self.norm = nn.LayerNorm(channels, eps=eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 3:
+            return self.norm(x.transpose(1, 2)).transpose(1, 2).contiguous()
+        if x.ndim == 4:
+            return (
+                self.norm(x.permute(0, 2, 3, 1))
+                .permute(0, 3, 1, 2)
+                .contiguous()
             )
-
-    for prefix in (
-        "module.",
-        "mst_model.",
-        "coarse_model.",
-    ):
-        state_dict = _strip_prefix(
-            state_dict,
-            prefix,
-        )
-
-    return state_dict
+        if x.ndim == 5:
+            return (
+                self.norm(x.permute(0, 2, 3, 4, 1))
+                .permute(0, 4, 1, 2, 3)
+                .contiguous()
+            )
+        raise ValueError(f"ChannelLayerNorm expects 3D/4D/5D input, got {x.shape}")
 
 
-def _extract_tensor_output(output: Any) -> torch.Tensor:
-    if torch.is_tensor(output):
-        return output
+def normalization(channels: int) -> nn.Module:
+    return ChannelLayerNorm(channels)
 
-    if isinstance(output, (tuple, list)):
-        for item in reversed(output):
-            if torch.is_tensor(item):
-                return item
 
-    if isinstance(output, dict):
-        for key in (
-            "prediction",
-            "reconstruction",
-            "output",
-            "out",
-            "hsi",
-        ):
-            value = output.get(key)
-            if torch.is_tensor(value):
-                return value
-
-        for value in output.values():
-            if torch.is_tensor(value):
-                return value
-
-    raise TypeError(
-        "MST++ must return a tensor, a sequence containing a tensor, "
-        "or a dictionary containing a tensor."
+def checkpoint(
+    function: Callable[..., torch.Tensor],
+    inputs: Tuple[torch.Tensor, ...],
+    parameters: Iterable[nn.Parameter],
+    enabled: bool,
+) -> torch.Tensor:
+    """PyTorch-native checkpoint wrapper with the BBDM call signature."""
+    del parameters
+    if not enabled:
+        return function(*inputs)
+    return torch.utils.checkpoint.checkpoint(  # type: ignore[attr-defined]
+        function,
+        *inputs,
+        use_reentrant=False,
     )
 
 
-# ============================================================================
-# Time embedding
-# ============================================================================
+# ===========================================================================
+# Optional spatial context rescaler
+# ===========================================================================
 
-class SinusoidalTimeEmbedding(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-
-        if dim < 2:
-            raise ValueError(
-                "Time-embedding dimension must be at least 2."
-            )
-
-        self.dim = dim
-
-    def forward(self, timestep: torch.Tensor) -> torch.Tensor:
-        half = self.dim // 2
-
-        if half == 1:
-            frequencies = torch.ones(
-                1,
-                device=timestep.device,
-                dtype=timestep.dtype,
-            )
-        else:
-            frequencies = torch.exp(
-                -math.log(10000.0)
-                * torch.arange(
-                    half,
-                    device=timestep.device,
-                    dtype=timestep.dtype,
-                )
-                / (half - 1)
-            )
-
-        angles = timestep[:, None] * frequencies[None, :]
-
-        embedding = torch.cat(
-            [
-                angles.sin(),
-                angles.cos(),
-            ],
-            dim=-1,
-        )
-
-        if embedding.shape[-1] < self.dim:
-            embedding = F.pad(
-                embedding,
-                (0, self.dim - embedding.shape[-1]),
-            )
-
-        return embedding
-
-
-# ============================================================================
-# MST denoiser
-# ============================================================================
-
-class MSTBBDMDenoiser(nn.Module):
+class SpatialRescaler(nn.Module):
     """
-    Predict the standard BBDM bridge objective.
+    Lightweight self-contained equivalent of BBDM's SpatialRescaler.
 
-    For the default ``grad`` objective:
-
-        target_objective = x_t - x_0
-
-    Therefore the clean HSI estimate is recovered as:
-
-        x_0_hat = x_t - predicted_objective
+    It repeatedly interpolates the spatial dimensions and can optionally map
+    the channel count using a 1x1 convolution.
     """
 
     def __init__(
         self,
-        hsi_channels: int = 31,
-        rgb_channels: int = 3,
-        n_feat: int = 31,
-        body_depth: int = 3,
-        mst_stage: int = 2,
-        num_blocks: Sequence[int] = (1, 1, 1),
+        n_stages: int = 1,
+        method: str = "bilinear",
+        multiplier: float = 0.5,
+        in_channels: int = 3,
+        out_channels: Optional[int] = None,
+        bias: bool = False,
     ):
         super().__init__()
-
-        self.hsi_channels = hsi_channels
-        self.rgb_channels = rgb_channels
-        self.pad_multiple = 2 ** mst_stage
-
-        input_channels = (
-            hsi_channels
-            + hsi_channels
-            + rgb_channels
+        self.n_stages = n_stages
+        self.method = method
+        self.multiplier = multiplier
+        self.channel_mapper = (
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=bias)
+            if out_channels is not None
+            else None
         )
 
-        self.conv_in = nn.Conv2d(
-            input_channels,
-            n_feat,
-            kernel_size=3,
-            stride=1,
-            padding=1,
-            bias=False,
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        align_corners = False if self.method in {"linear", "bilinear", "bicubic", "trilinear"} else None
+        for _ in range(self.n_stages):
+            x = F.interpolate(
+                x,
+                scale_factor=self.multiplier,
+                mode=self.method,
+                align_corners=align_corners,
+            )
+        if self.channel_mapper is not None:
+            x = self.channel_mapper(x)
+        return x
+
+
+# ===========================================================================
+# BBDM-style UNet
+# ===========================================================================
+
+class TimestepBlock(nn.Module):
+    @abstractmethod
+    def forward(self, x: torch.Tensor, embedding: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+
+class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
+    def forward(
+        self,
+        x: torch.Tensor,
+        embedding: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        for layer in self:
+            if isinstance(layer, TimestepBlock):
+                x = layer(x, embedding)
+            elif isinstance(layer, ContextBlock):
+                x = layer(x, context)
+            else:
+                x = layer(x)
+        return x
+
+
+class Upsample(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        use_conv: bool,
+        dims: int = 2,
+        out_channels: Optional[int] = None,
+        padding: int = 1,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.out_channels = default(out_channels, channels)
+        self.use_conv = use_conv
+        self.dims = dims
+        if use_conv:
+            self.conv = conv_nd(
+                dims,
+                channels,
+                self.out_channels,
+                kernel_size=3,
+                padding=padding,
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[1] != self.channels:
+            raise ValueError(f"Expected {self.channels} channels, got {x.shape[1]}")
+        if self.dims == 3:
+            x = F.interpolate(
+                x,
+                size=(x.shape[2], x.shape[3] * 2, x.shape[4] * 2),
+                mode="nearest",
+            )
+        else:
+            x = F.interpolate(x, scale_factor=2, mode="nearest")
+        return self.conv(x) if self.use_conv else x
+
+
+class Downsample(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        use_conv: bool,
+        dims: int = 2,
+        out_channels: Optional[int] = None,
+        padding: int = 1,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.out_channels = default(out_channels, channels)
+        stride = 2 if dims != 3 else (1, 2, 2)
+        if use_conv:
+            self.op = conv_nd(
+                dims,
+                channels,
+                self.out_channels,
+                kernel_size=3,
+                stride=stride,
+                padding=padding,
+            )
+        else:
+            if channels != self.out_channels:
+                raise ValueError("Pooling downsample cannot change channel count.")
+            self.op = avg_pool_nd(dims, kernel_size=stride, stride=stride)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[1] != self.channels:
+            raise ValueError(f"Expected {self.channels} channels, got {x.shape[1]}")
+        return self.op(x)
+
+
+class ResBlock(TimestepBlock):
+    def __init__(
+        self,
+        channels: int,
+        emb_channels: int,
+        dropout: float,
+        out_channels: Optional[int] = None,
+        use_conv: bool = False,
+        use_scale_shift_norm: bool = False,
+        dims: int = 2,
+        use_checkpoint: bool = False,
+        up: bool = False,
+        down: bool = False,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.out_channels = default(out_channels, channels)
+        self.use_checkpoint = use_checkpoint
+        self.use_scale_shift_norm = use_scale_shift_norm
+        self.updown = up or down
+
+        self.in_layers = nn.Sequential(
+            normalization(channels),
+            nn.SiLU(),
+            conv_nd(dims, channels, self.out_channels, 3, padding=1),
         )
 
-        self.time_mlp = nn.Sequential(
-            SinusoidalTimeEmbedding(n_feat),
-            nn.Linear(n_feat, n_feat * 4),
-            nn.GELU(),
-            nn.Linear(n_feat * 4, n_feat),
+        if up:
+            self.h_upd = Upsample(channels, False, dims)
+            self.x_upd = Upsample(channels, False, dims)
+        elif down:
+            self.h_upd = Downsample(channels, False, dims)
+            self.x_upd = Downsample(channels, False, dims)
+        else:
+            self.h_upd = nn.Identity()
+            self.x_upd = nn.Identity()
+
+        self.emb_layers = nn.Sequential(
+            nn.SiLU(),
+            linear(
+                emb_channels,
+                2 * self.out_channels if use_scale_shift_norm else self.out_channels,
+            ),
+        )
+        self.out_layers = nn.Sequential(
+            normalization(self.out_channels),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            zero_module(
+                conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1)
+            ),
         )
 
-        self.body = nn.Sequential(
-            *[
-                MST(
-                    in_dim=n_feat,
-                    out_dim=n_feat,
-                    dim=n_feat,
-                    stage=mst_stage,
-                    num_blocks=list(num_blocks),
+        if self.out_channels == channels:
+            self.skip_connection = nn.Identity()
+        elif use_conv:
+            self.skip_connection = conv_nd(
+                dims, channels, self.out_channels, 3, padding=1
+            )
+        else:
+            self.skip_connection = conv_nd(dims, channels, self.out_channels, 1)
+
+    def forward(self, x: torch.Tensor, embedding: torch.Tensor) -> torch.Tensor:
+        return checkpoint(
+            self._forward,
+            (x, embedding),
+            self.parameters(),
+            self.use_checkpoint,
+        )
+
+    def _forward(self, x: torch.Tensor, embedding: torch.Tensor) -> torch.Tensor:
+        if self.updown:
+            in_rest = self.in_layers[:-1]
+            in_conv = self.in_layers[-1]
+            h = in_rest(x)
+            h = self.h_upd(h)
+            x = self.x_upd(x)
+            h = in_conv(h)
+        else:
+            h = self.in_layers(x)
+
+        emb_out = self.emb_layers(embedding).to(dtype=h.dtype)
+        while emb_out.ndim < h.ndim:
+            emb_out = emb_out[..., None]
+
+        if self.use_scale_shift_norm:
+            out_norm = self.out_layers[0]
+            out_rest = self.out_layers[1:]
+            scale, shift = torch.chunk(emb_out, 2, dim=1)
+            h = out_norm(h) * (1 + scale) + shift
+            h = out_rest(h)
+        else:
+            h = self.out_layers(h + emb_out)
+
+        return self.skip_connection(x) + h
+
+
+class QKVAttention(nn.Module):
+    def __init__(self, heads: int):
+        super().__init__()
+        self.heads = heads
+
+    def forward(self, qkv: torch.Tensor) -> torch.Tensor:
+        batch, width, length = qkv.shape
+        if width % (3 * self.heads) != 0:
+            raise ValueError("QKV width must be divisible by 3 * number of heads.")
+        channels = width // (3 * self.heads)
+        q, k, v = qkv.reshape(
+            batch * self.heads, 3 * channels, length
+        ).split(channels, dim=1)
+        scale = 1.0 / math.sqrt(math.sqrt(channels))
+        weights = torch.einsum(
+            "bct,bcs->bts",
+            q * scale,
+            k * scale,
+        )
+        weights = torch.softmax(weights.float(), dim=-1).to(weights.dtype)
+        attended = torch.einsum("bts,bcs->bct", weights, v)
+        return attended.reshape(batch, self.heads * channels, length)
+
+
+class AttentionBlock(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        num_heads: int = 1,
+        num_head_channels: int = -1,
+        use_checkpoint: bool = False,
+        use_new_attention_order: bool = False,
+    ):
+        super().__init__()
+        del use_new_attention_order
+        self.channels = channels
+        self.use_checkpoint = use_checkpoint
+        if num_head_channels == -1:
+            self.num_heads = num_heads
+        else:
+            if channels % num_head_channels != 0:
+                raise ValueError(
+                    f"{channels} channels are not divisible by "
+                    f"num_head_channels={num_head_channels}"
                 )
-                for _ in range(body_depth)
+            self.num_heads = channels // num_head_channels
+        self.norm = normalization(channels)
+        self.qkv = conv_nd(1, channels, channels * 3, 1)
+        self.attention = QKVAttention(self.num_heads)
+        self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return checkpoint(
+            self._forward,
+            (x,),
+            self.parameters(),
+            self.use_checkpoint,
+        )
+
+    def _forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, channels, *spatial = x.shape
+        residual = x.reshape(batch, channels, -1)
+        qkv = self.qkv(self.norm(residual))
+        h = self.proj_out(self.attention(qkv))
+        return (residual + h).reshape(batch, channels, *spatial)
+
+
+class ContextBlock(nn.Module):
+    """
+    Compact spatial context injection compatible with BBDM's `context=` API.
+
+    For HSI bridge training, `context` is normally the MST++ coarse HSI cube.
+    The context is resized, reduced to one channel by a parameter-free mean,
+    projected to the current feature width, and added residually.
+
+    Set `condition_key="nocond"` to disable it. The bridge endpoint y remains
+    present in q_sample and p_sample regardless of context conditioning.
+    """
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.proj = nn.Conv2d(1, channels, kernel_size=1)
+        self.gate = nn.Parameter(torch.zeros(1, channels, 1, 1))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        context: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if context is None:
+            return x
+        if context.ndim != 4:
+            raise ValueError(
+                f"ContextBlock expects NCHW context, got {context.shape}"
+            )
+        context = F.interpolate(
+            context,
+            size=x.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        context = context.mean(dim=1, keepdim=True)
+        return x + self.gate * self.proj(context).to(dtype=x.dtype)
+
+
+class UNetModel(nn.Module):
+    """
+    Self-contained BBDM/OpenAI-style UNet.
+
+    The constructor accepts the principal fields used by BBDM YAML configs.
+    Extra configuration fields are accepted through **kwargs so existing
+    UNetParams objects can be passed using vars(UNetParams).
+    """
+
+    def __init__(
+        self,
+        image_size: int,
+        in_channels: int,
+        model_channels: int,
+        out_channels: int,
+        num_res_blocks: int,
+        attention_resolutions: Union[Sequence[int], str],
+        dropout: float = 0.0,
+        channel_mult: Sequence[int] = (1, 2, 4, 8),
+        conv_resample: bool = True,
+        dims: int = 2,
+        num_classes: Optional[int] = None,
+        use_checkpoint: bool = False,
+        use_fp16: bool = False,
+        num_heads: int = 1,
+        num_head_channels: int = -1,
+        num_heads_upsample: int = -1,
+        use_scale_shift_norm: bool = False,
+        resblock_updown: bool = False,
+        use_new_attention_order: bool = False,
+        use_spatial_transformer: bool = False,
+        transformer_depth: int = 1,
+        context_dim: Optional[int] = None,
+        n_embed: Optional[int] = None,
+        legacy: bool = True,
+        condition_key: str = "nocond",
+        **kwargs: Any,
+    ):
+        super().__init__()
+        del (
+            image_size,
+            num_classes,
+            use_fp16,
+            transformer_depth,
+            context_dim,
+            n_embed,
+            legacy,
+            kwargs,
+        )
+        if dims != 2 and use_spatial_transformer:
+            raise NotImplementedError(
+                "The self-contained ContextBlock currently supports 2D inputs."
+            )
+
+        if isinstance(channel_mult, str):
+            channel_mult = tuple(int(value) for value in channel_mult.split(","))
+        else:
+            channel_mult = tuple(channel_mult)
+
+        if isinstance(attention_resolutions, str):
+            attention_resolutions = tuple(
+                int(value) for value in attention_resolutions.split(",")
+            )
+        attention_resolutions = set(attention_resolutions)
+
+        if num_heads_upsample == -1:
+            num_heads_upsample = num_heads
+
+        self.in_channels = in_channels
+        self.model_channels = model_channels
+        self.out_channels = out_channels
+        self.num_res_blocks = num_res_blocks
+        self.condition_key = condition_key
+        self.dtype = torch.float32
+
+        time_embed_dim = model_channels * 4
+        self.time_embed = nn.Sequential(
+            linear(model_channels, time_embed_dim),
+            nn.SiLU(),
+            linear(time_embed_dim, time_embed_dim),
+        )
+
+        channel = int(channel_mult[0] * model_channels)
+        self.input_blocks = nn.ModuleList(
+            [
+                TimestepEmbedSequential(
+                    conv_nd(dims, in_channels, channel, 3, padding=1)
+                )
             ]
         )
+        input_block_channels = [channel]
+        downsample_factor = 1
 
-        self.conv_out = nn.Conv2d(
-            n_feat,
-            hsi_channels,
-            kernel_size=3,
-            stride=1,
-            padding=1,
-            bias=False,
+        for level, multiplier in enumerate(channel_mult):
+            for _ in range(num_res_blocks):
+                layers: list[nn.Module] = [
+                    ResBlock(
+                        channel,
+                        time_embed_dim,
+                        dropout,
+                        out_channels=int(multiplier * model_channels),
+                        dims=dims,
+                        use_checkpoint=use_checkpoint,
+                        use_scale_shift_norm=use_scale_shift_norm,
+                    )
+                ]
+                channel = int(multiplier * model_channels)
+
+                if downsample_factor in attention_resolutions:
+                    layers.append(
+                        AttentionBlock(
+                            channel,
+                            num_heads=num_heads,
+                            num_head_channels=num_head_channels,
+                            use_checkpoint=use_checkpoint,
+                            use_new_attention_order=use_new_attention_order,
+                        )
+                    )
+                if use_spatial_transformer or condition_key != "nocond":
+                    layers.append(ContextBlock(channel))
+
+                self.input_blocks.append(TimestepEmbedSequential(*layers))
+                input_block_channels.append(channel)
+
+            if level != len(channel_mult) - 1:
+                if resblock_updown:
+                    down_layer: nn.Module = ResBlock(
+                        channel,
+                        time_embed_dim,
+                        dropout,
+                        out_channels=channel,
+                        dims=dims,
+                        use_checkpoint=use_checkpoint,
+                        use_scale_shift_norm=use_scale_shift_norm,
+                        down=True,
+                    )
+                else:
+                    down_layer = Downsample(
+                        channel,
+                        conv_resample,
+                        dims=dims,
+                        out_channels=channel,
+                    )
+                self.input_blocks.append(TimestepEmbedSequential(down_layer))
+                input_block_channels.append(channel)
+                downsample_factor *= 2
+
+        middle_layers: list[nn.Module] = [
+            ResBlock(
+                channel,
+                time_embed_dim,
+                dropout,
+                dims=dims,
+                use_checkpoint=use_checkpoint,
+                use_scale_shift_norm=use_scale_shift_norm,
+            ),
+            AttentionBlock(
+                channel,
+                num_heads=num_heads,
+                num_head_channels=num_head_channels,
+                use_checkpoint=use_checkpoint,
+                use_new_attention_order=use_new_attention_order,
+            ),
+        ]
+        if use_spatial_transformer or condition_key != "nocond":
+            middle_layers.append(ContextBlock(channel))
+        middle_layers.append(
+            ResBlock(
+                channel,
+                time_embed_dim,
+                dropout,
+                dims=dims,
+                use_checkpoint=use_checkpoint,
+                use_scale_shift_norm=use_scale_shift_norm,
+            )
+        )
+        self.middle_block = TimestepEmbedSequential(*middle_layers)
+
+        self.output_blocks = nn.ModuleList([])
+        for level, multiplier in list(enumerate(channel_mult))[::-1]:
+            for block_index in range(num_res_blocks + 1):
+                skip_channels = input_block_channels.pop()
+                layers = [
+                    ResBlock(
+                        channel + skip_channels,
+                        time_embed_dim,
+                        dropout,
+                        out_channels=int(model_channels * multiplier),
+                        dims=dims,
+                        use_checkpoint=use_checkpoint,
+                        use_scale_shift_norm=use_scale_shift_norm,
+                    )
+                ]
+                channel = int(model_channels * multiplier)
+
+                if downsample_factor in attention_resolutions:
+                    layers.append(
+                        AttentionBlock(
+                            channel,
+                            num_heads=num_heads_upsample,
+                            num_head_channels=num_head_channels,
+                            use_checkpoint=use_checkpoint,
+                            use_new_attention_order=use_new_attention_order,
+                        )
+                    )
+                if use_spatial_transformer or condition_key != "nocond":
+                    layers.append(ContextBlock(channel))
+
+                if level and block_index == num_res_blocks:
+                    if resblock_updown:
+                        layers.append(
+                            ResBlock(
+                                channel,
+                                time_embed_dim,
+                                dropout,
+                                out_channels=channel,
+                                dims=dims,
+                                use_checkpoint=use_checkpoint,
+                                use_scale_shift_norm=use_scale_shift_norm,
+                                up=True,
+                            )
+                        )
+                    else:
+                        layers.append(
+                            Upsample(
+                                channel,
+                                conv_resample,
+                                dims=dims,
+                                out_channels=channel,
+                            )
+                        )
+                    downsample_factor //= 2
+
+                self.output_blocks.append(TimestepEmbedSequential(*layers))
+
+        self.out = nn.Sequential(
+            normalization(channel),
+            nn.SiLU(),
+            zero_module(conv_nd(dims, channel, out_channels, 3, padding=1)),
         )
 
     def forward(
         self,
-        x_t: torch.Tensor,
-        coarse_hsi: torch.Tensor,
-        rgb: torch.Tensor,
-        t: torch.Tensor,
-        total_steps: int,
+        x: torch.Tensor,
+        timesteps: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
-        if x_t.shape != coarse_hsi.shape:
-            raise ValueError(
-                "x_t and coarse_hsi must have identical shapes, "
-                f"but received {x_t.shape} and {coarse_hsi.shape}."
-            )
+        del kwargs
+        embeddings = self.time_embed(
+            timestep_embedding(timesteps, self.model_channels)
+        )
 
-        if rgb.shape[0] != x_t.shape[0]:
-            raise ValueError(
-                "RGB and HSI tensors must have the same batch size."
-            )
+        h = x.to(dtype=self.dtype)
+        skips = []
+        for module in self.input_blocks:
+            h = module(h, embeddings, context)
+            skips.append(h)
 
-        if rgb.shape[-2:] != x_t.shape[-2:]:
-            raise ValueError(
-                "RGB and HSI tensors must have the same spatial size."
-            )
+        h = self.middle_block(h, embeddings, context)
 
-        _, _, height, width = x_t.shape
+        for module in self.output_blocks:
+            h = torch.cat([h, skips.pop()], dim=1)
+            h = module(h, embeddings, context)
 
-        pad_height = (
-            self.pad_multiple - height % self.pad_multiple
-        ) % self.pad_multiple
+        return self.out(h).to(dtype=x.dtype)
 
-        pad_width = (
-            self.pad_multiple - width % self.pad_multiple
-        ) % self.pad_multiple
 
-        # The imported MST architecture contains depthwise positional
-        # convolutions that can fail under FP16/BF16 autocast on some Kaggle
-        # GPU/cuDNN combinations. Run the trainable MST denoiser in FP32.
-        #
-        # Autocast is disabled only for this denoiser. Gradients are still
-        # calculated normally, so the MST denoiser remains fully trainable.
-        with torch.autocast(
-            device_type=x_t.device.type,
-            enabled=False,
+# ===========================================================================
+# Brownian bridge: equations retained from the supplied model
+# ===========================================================================
+
+class BrownianBridgeModel(nn.Module):
+    def __init__(self, model_config: Any):
+        super().__init__()
+        self.model_config = model_config
+        # model hyperparameters
+        model_params = model_config.BB.params
+        self.num_timesteps = model_params.num_timesteps
+        self.mt_type = model_params.mt_type
+        self.max_var = model_params.max_var if model_params.__contains__("max_var") else 1
+        self.eta = model_params.eta if model_params.__contains__("eta") else 1
+        self.skip_sample = model_params.skip_sample
+        self.sample_type = model_params.sample_type
+        self.sample_step = model_params.sample_step
+        self.steps = None
+        self.register_schedule()
+
+        # loss and objective
+        self.loss_type = model_params.loss_type
+        self.objective = model_params.objective
+
+        # UNet
+        self.image_size = model_params.UNetParams.image_size
+        self.channels = model_params.UNetParams.in_channels
+        self.condition_key = model_params.UNetParams.condition_key
+
+        self.denoise_fn = UNetModel(**vars(model_params.UNetParams))
+
+    def register_schedule(self):
+        T = self.num_timesteps
+
+        if self.mt_type == "linear":
+            m_min, m_max = 0.001, 0.999
+            m_t = np.linspace(m_min, m_max, T)
+        elif self.mt_type == "sin":
+            m_t = 1.0075 ** np.linspace(0, T, T)
+            m_t = m_t / m_t[-1]
+            m_t[-1] = 0.999
+        else:
+            raise NotImplementedError
+        m_tminus = np.append(0, m_t[:-1])
+
+        variance_t = 2. * (m_t - m_t ** 2) * self.max_var
+        variance_tminus = np.append(0., variance_t[:-1])
+        variance_t_tminus = variance_t - variance_tminus * ((1. - m_t) / (1. - m_tminus)) ** 2
+        posterior_variance_t = variance_t_tminus * variance_tminus / variance_t
+
+        to_torch = partial(torch.tensor, dtype=torch.float32)
+        self.register_buffer('m_t', to_torch(m_t))
+        self.register_buffer('m_tminus', to_torch(m_tminus))
+        self.register_buffer('variance_t', to_torch(variance_t))
+        self.register_buffer('variance_tminus', to_torch(variance_tminus))
+        self.register_buffer('variance_t_tminus', to_torch(variance_t_tminus))
+        self.register_buffer('posterior_variance_t', to_torch(posterior_variance_t))
+
+        if self.skip_sample:
+            if self.sample_type == 'linear':
+                midsteps = torch.arange(self.num_timesteps - 1, 1,
+                                        step=-((self.num_timesteps - 1) / (self.sample_step - 2))).long()
+                self.steps = torch.cat((midsteps, torch.Tensor([1, 0]).long()), dim=0)
+            elif self.sample_type == 'cosine':
+                steps = np.linspace(start=0, stop=self.num_timesteps, num=self.sample_step + 1)
+                steps = (np.cos(steps / self.num_timesteps * np.pi) + 1.) / 2. * self.num_timesteps
+                self.steps = torch.from_numpy(steps)
+        else:
+            self.steps = torch.arange(self.num_timesteps-1, -1, -1)
+
+    def apply(self, weight_init):
+        self.denoise_fn.apply(weight_init)
+        return self
+
+    def get_parameters(self):
+        return self.denoise_fn.parameters()
+
+    def forward(self, x, y, context=None):
+        if self.condition_key == "nocond":
+            context = None
+        else:
+            context = y if context is None else context
+        b, c, h, w, device, img_size, = *x.shape, x.device, self.image_size
+        assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
+        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
+        return self.p_losses(x, y, context, t)
+
+    def p_losses(self, x0, y, context, t, noise=None):
+        """
+        model loss
+        :param x0: encoded x_ori, E(x_ori) = x0
+        :param y: encoded y_ori, E(y_ori) = y
+        :param y_ori: original source domain image
+        :param t: timestep
+        :param noise: Standard Gaussian Noise
+        :return: loss
+        """
+        b, c, h, w = x0.shape
+        noise = default(noise, lambda: torch.randn_like(x0))
+
+        x_t, objective = self.q_sample(x0, y, t, noise)
+        objective_recon = self.denoise_fn(x_t, timesteps=t, context=context)
+
+        if self.loss_type == 'l1':
+            recloss = (objective - objective_recon).abs().mean()
+        elif self.loss_type == 'l2':
+            recloss = F.mse_loss(objective, objective_recon)
+        else:
+            raise NotImplementedError()
+
+        x0_recon = self.predict_x0_from_objective(x_t, y, t, objective_recon)
+        log_dict = {
+            "loss": recloss,
+            "x0_recon": x0_recon
+        }
+        return recloss, log_dict
+
+    def q_sample(self, x0, y, t, noise=None):
+        noise = default(noise, lambda: torch.randn_like(x0))
+        m_t = extract(self.m_t, t, x0.shape)
+        var_t = extract(self.variance_t, t, x0.shape)
+        sigma_t = torch.sqrt(var_t)
+
+        if self.objective == 'grad':
+            objective = m_t * (y - x0) + sigma_t * noise
+        elif self.objective == 'noise':
+            objective = noise
+        elif self.objective == 'ysubx':
+            objective = y - x0
+        else:
+            raise NotImplementedError()
+
+        return (
+            (1. - m_t) * x0 + m_t * y + sigma_t * noise,
+            objective
+        )
+
+    def predict_x0_from_objective(self, x_t, y, t, objective_recon):
+        if self.objective == 'grad':
+            x0_recon = x_t - objective_recon
+        elif self.objective == 'noise':
+            m_t = extract(self.m_t, t, x_t.shape)
+            var_t = extract(self.variance_t, t, x_t.shape)
+            sigma_t = torch.sqrt(var_t)
+            x0_recon = (x_t - m_t * y - sigma_t * objective_recon) / (1. - m_t)
+        elif self.objective == 'ysubx':
+            x0_recon = y - objective_recon
+        else:
+            raise NotImplementedError
+        return x0_recon
+
+    @torch.no_grad()
+    def q_sample_loop(self, x0, y):
+        imgs = [x0]
+        for i in tqdm(range(self.num_timesteps), desc='q sampling loop', total=self.num_timesteps):
+            t = torch.full((y.shape[0],), i, device=x0.device, dtype=torch.long)
+            img, _ = self.q_sample(x0, y, t)
+            imgs.append(img)
+        return imgs
+
+    @torch.no_grad()
+    def p_sample(self, x_t, y, context, i, clip_denoised=False):
+        b, *_, device = *x_t.shape, x_t.device
+        if self.steps[i] == 0:
+            t = torch.full((x_t.shape[0],), self.steps[i], device=x_t.device, dtype=torch.long)
+            objective_recon = self.denoise_fn(x_t, timesteps=t, context=context)
+            x0_recon = self.predict_x0_from_objective(x_t, y, t, objective_recon=objective_recon)
+            if clip_denoised:
+                x0_recon.clamp_(-1., 1.)
+            return x0_recon, x0_recon
+        else:
+            t = torch.full((x_t.shape[0],), self.steps[i], device=x_t.device, dtype=torch.long)
+            n_t = torch.full((x_t.shape[0],), self.steps[i+1], device=x_t.device, dtype=torch.long)
+
+            objective_recon = self.denoise_fn(x_t, timesteps=t, context=context)
+            x0_recon = self.predict_x0_from_objective(x_t, y, t, objective_recon=objective_recon)
+            if clip_denoised:
+                x0_recon.clamp_(-1., 1.)
+
+            m_t = extract(self.m_t, t, x_t.shape)
+            m_nt = extract(self.m_t, n_t, x_t.shape)
+            var_t = extract(self.variance_t, t, x_t.shape)
+            var_nt = extract(self.variance_t, n_t, x_t.shape)
+            sigma2_t = (var_t - var_nt * (1. - m_t) ** 2 / (1. - m_nt) ** 2) * var_nt / var_t
+            sigma_t = torch.sqrt(sigma2_t) * self.eta
+
+            noise = torch.randn_like(x_t)
+            x_tminus_mean = (1. - m_nt) * x0_recon + m_nt * y + torch.sqrt((var_nt - sigma2_t) / var_t) * \
+                            (x_t - (1. - m_t) * x0_recon - m_t * y)
+
+            return x_tminus_mean + sigma_t * noise, x0_recon
+
+    @torch.no_grad()
+    def p_sample_loop(self, y, context=None, clip_denoised=True, sample_mid_step=False):
+        if self.condition_key == "nocond":
+            context = None
+        else:
+            context = y if context is None else context
+
+        if sample_mid_step:
+            imgs, one_step_imgs = [y], []
+            for i in tqdm(range(len(self.steps)), desc=f'sampling loop time step', total=len(self.steps)):
+                img, x0_recon = self.p_sample(x_t=imgs[-1], y=y, context=context, i=i, clip_denoised=clip_denoised)
+                imgs.append(img)
+                one_step_imgs.append(x0_recon)
+            return imgs, one_step_imgs
+        else:
+            img = y
+            for i in tqdm(range(len(self.steps)), desc=f'sampling loop time step', total=len(self.steps)):
+                img, _ = self.p_sample(x_t=img, y=y, context=context, i=i, clip_denoised=clip_denoised)
+            return img
+
+    @torch.no_grad()
+    def sample(self, y, context=None, clip_denoised=True, sample_mid_step=False):
+        return self.p_sample_loop(y, context, clip_denoised, sample_mid_step)
+
+
+# ===========================================================================
+# Frozen MST++ coarse estimator + bridge wrapper
+# ===========================================================================
+
+def _get_config_value(
+    config: Any,
+    name: str,
+    default_value: Any = None,
+) -> Any:
+    if config is None:
+        return default_value
+    if isinstance(config, dict):
+        return config.get(name, default_value)
+    return getattr(config, name, default_value)
+
+
+def _strip_state_dict_prefixes(
+    state_dict: dict[str, torch.Tensor],
+    prefixes: Sequence[str] = ("module.", "model.", "mst_plus_plus.", "mstpp."),
+) -> dict[str, torch.Tensor]:
+    cleaned = dict(state_dict)
+    changed = True
+    while changed:
+        changed = False
+        for prefix in prefixes:
+            if cleaned and all(key.startswith(prefix) for key in cleaned):
+                cleaned = {
+                    key[len(prefix):]: value
+                    for key, value in cleaned.items()
+                }
+                changed = True
+    return cleaned
+
+
+def load_mstpp_checkpoint(
+    model: nn.Module,
+    checkpoint_path: Union[str, Path],
+    strict: bool = True,
+) -> Tuple[list[str], list[str]]:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+    if isinstance(checkpoint, dict):
+        candidate_keys = (
+            "mst_plus_plus_state_dict",
+            "mstpp_state_dict",
+            "model_state_dict",
+            "state_dict",
+            "model",
+        )
+        state_dict = None
+        for key in candidate_keys:
+            value = checkpoint.get(key)
+            if isinstance(value, dict):
+                state_dict = value
+                break
+        if state_dict is None and all(
+            isinstance(value, torch.Tensor) for value in checkpoint.values()
         ):
-            inputs = torch.cat(
-                [
-                    x_t.float(),
-                    coarse_hsi.float(),
-                    rgb.float(),
-                ],
-                dim=1,
-            ).contiguous()
+            state_dict = checkpoint
+    else:
+        state_dict = checkpoint
 
-            if pad_height or pad_width:
-                padding_mode = (
-                    "reflect"
-                    if height > pad_height and width > pad_width
-                    else "replicate"
-                )
+    if not isinstance(state_dict, dict):
+        raise TypeError(
+            "Could not locate an MST++ state_dict in checkpoint "
+            f"{checkpoint_path!s}."
+        )
 
-                inputs = F.pad(
-                    inputs,
-                    (0, pad_width, 0, pad_height),
-                    mode=padding_mode,
-                )
-
-            features = self.conv_in(inputs)
-
-            normalized_timestep = (
-                t.float() / float(total_steps)
-            )
-
-            time_features = self.time_mlp(
-                normalized_timestep
-            ).float()
-
-            features = (
-                features
-                + time_features[:, :, None, None]
-            )
-
-            features = self.body(
-                features.contiguous()
-            )
-
-            predicted_objective = self.conv_out(
-                features
-            )
-
-        return predicted_objective[
-            :,
-            :,
-            :height,
-            :width,
-        ].contiguous()
+    state_dict = _strip_state_dict_prefixes(state_dict)
+    incompatible = model.load_state_dict(state_dict, strict=strict)
+    return list(incompatible.missing_keys), list(incompatible.unexpected_keys)
 
 
-# ============================================================================
-# Standard Brownian Bridge Diffusion Model
-# ============================================================================
-
-class BrownianBridgeDiffusion(nn.Module):
+class MSTPlusPlusBrownianBridge(nn.Module):
     """
-    Brownian bridge from the clean HSI x_0 to the frozen MST++ endpoint y.
+    Complete RGB -> frozen MST++ coarse HSI -> Brownian bridge refinement model.
 
-    Forward process:
+    Configuration:
+        model_config.BB.params
+            Used unchanged by BrownianBridgeModel.
 
-        x_t = (1 - m_t) x_0 + m_t y + sqrt(delta_t) epsilon
+        model_config.MSTPP.params (optional)
+            Keyword arguments used to construct MST_Plus_Plus.
 
-    Standard ``grad`` training objective:
+        model_config.MSTPP.checkpoint_path
+            Path to the pretrained MST++ checkpoint.
 
-        objective_t
-            = m_t (y - x_0) + sqrt(delta_t) epsilon
-            = x_t - x_0
+        model_config.MSTPP.strict_load (default True)
+            Whether checkpoint loading must match exactly.
 
-    The denoiser does not predict ``x_0 - y``. It predicts the timestep-
-    dependent Brownian-bridge objective.
+        model_config.MSTPP.output_key (optional)
+            Dict key when MST++ returns a dictionary.
+
+        model_config.MSTPP.output_index (default -1)
+            Tuple/list index when MST++ returns multiple predictions.
     """
 
     def __init__(
         self,
-        denoiser: nn.Module,
-        num_timesteps: int = 50,
-        midpoint_variance: float = 0.05,
+        model_config: Any,
+        mstpp_model: Optional[nn.Module] = None,
+        mstpp_factory: Optional[Callable[..., nn.Module]] = None,
     ):
         super().__init__()
+        self.model_config = model_config
+        self.bridge = BrownianBridgeModel(model_config)
 
-        if num_timesteps < 2:
-            raise ValueError(
-                "num_timesteps must be at least 2."
+        mstpp_config = _get_config_value(model_config, "MSTPP")
+        mstpp_params = _get_config_value(mstpp_config, "params", {})
+        if not isinstance(mstpp_params, dict):
+            try:
+                mstpp_params = vars(mstpp_params)
+            except TypeError as error:
+                raise TypeError(
+                    "model_config.MSTPP.params must be a dict or namespace."
+                ) from error
+
+        if mstpp_model is not None:
+            self.mstpp = mstpp_model
+        else:
+            factory = mstpp_factory
+            if factory is None:
+                factory = MST_Plus_Plus
+            if factory is None:
+                raise ImportError(
+                    "MST++ could not be imported. Edit the import near the top "
+                    "of this file, or pass mstpp_model/mstpp_factory explicitly."
+                )
+            self.mstpp = factory(**mstpp_params)
+
+        checkpoint_path = _get_config_value(mstpp_config, "checkpoint_path")
+        strict_load = bool(_get_config_value(mstpp_config, "strict_load", True))
+        if checkpoint_path:
+            missing, unexpected = load_mstpp_checkpoint(
+                self.mstpp,
+                checkpoint_path,
+                strict=strict_load,
+            )
+            if not strict_load and (missing or unexpected):
+                print(
+                    "MST++ checkpoint loaded non-strictly. "
+                    f"Missing keys: {missing}; unexpected keys: {unexpected}"
+                )
+
+        self.output_key = _get_config_value(mstpp_config, "output_key")
+        self.output_index = int(
+            _get_config_value(mstpp_config, "output_index", -1)
+        )
+        self.freeze_mstpp()
+
+    def freeze_mstpp(self) -> None:
+        self.mstpp.eval()
+        for parameter in self.mstpp.parameters():
+            parameter.requires_grad_(False)
+
+    def train(self, mode: bool = True) -> "MSTPlusPlusBrownianBridge":
+        super().train(mode)
+        # Keep the coarse estimator frozen and in evaluation mode even while
+        # the bridge UNet is training.
+        self.mstpp.eval()
+        return self
+
+    def _select_mstpp_output(self, output: Any) -> torch.Tensor:
+        if isinstance(output, torch.Tensor):
+            coarse = output
+        elif isinstance(output, dict):
+            if self.output_key is not None:
+                if self.output_key not in output:
+                    raise KeyError(
+                        f"MST++ output does not contain key {self.output_key!r}. "
+                        f"Available keys: {list(output)}"
+                    )
+                coarse = output[self.output_key]
+            else:
+                tensor_values = [
+                    value for value in output.values()
+                    if isinstance(value, torch.Tensor)
+                ]
+                if not tensor_values:
+                    raise TypeError("MST++ dictionary output contains no tensor.")
+                coarse = tensor_values[self.output_index]
+        elif isinstance(output, (tuple, list)):
+            coarse = output[self.output_index]
+        else:
+            raise TypeError(
+                "Unsupported MST++ output type: "
+                f"{type(output).__name__}"
             )
 
-        if midpoint_variance <= 0:
-            raise ValueError(
-                "midpoint_variance must be positive."
-            )
+        if not isinstance(coarse, torch.Tensor):
+            raise TypeError("Selected MST++ prediction is not a tensor.")
+        return coarse
 
-        self.denoiser = denoiser
-        self.num_timesteps = num_timesteps
+    @torch.no_grad()
+    def coarse_estimate(self, rgb: torch.Tensor) -> torch.Tensor:
+        self.mstpp.eval()
+        output = self.mstpp(rgb)
+        coarse = self._select_mstpp_output(output)
+        return coarse.detach()
 
-        m_schedule = torch.linspace(
-            0.0,
-            1.0,
-            num_timesteps + 1,
-        )
-
-        delta_schedule = (
-            4.0
-            * midpoint_variance
-            * m_schedule
-            * (1.0 - m_schedule)
-        )
-
-        delta_schedule[0] = 0.0
-        delta_schedule[-1] = 0.0
-
-        self.register_buffer(
-            "m_schedule",
-            m_schedule,
-        )
-        self.register_buffer(
-            "delta_schedule",
-            delta_schedule,
-        )
-
-    @staticmethod
-    def _extract(
-        values: torch.Tensor,
-        t: torch.Tensor,
-        reference: torch.Tensor,
-    ) -> torch.Tensor:
-        selected = values.gather(0, t)
-
-        return selected.reshape(
-            t.shape[0],
-            *((1,) * (reference.ndim - 1)),
-        ).to(reference.dtype)
-
-    def q_sample(
+    def _validate_endpoints(
         self,
+        coarse: torch.Tensor,
         ground_truth: torch.Tensor,
-        coarse_hsi: torch.Tensor,
-        t: torch.Tensor,
-        noise: Optional[torch.Tensor] = None,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        if ground_truth.shape != coarse_hsi.shape:
+    ) -> None:
+        if coarse.shape != ground_truth.shape:
             raise ValueError(
-                "ground_truth and coarse_hsi must have identical shapes."
+                "The Brownian bridge endpoints must have identical shapes. "
+                f"MST++ produced {tuple(coarse.shape)}, while ground truth is "
+                f"{tuple(ground_truth.shape)}."
+            )
+        if coarse.shape[1] != self.bridge.channels:
+            raise ValueError(
+                f"UNet in_channels={self.bridge.channels}, but the bridge "
+                f"endpoint has {coarse.shape[1]} channels."
             )
 
-        if noise is None:
-            noise = torch.randn_like(ground_truth)
-
-        m_t = self._extract(
-            self.m_schedule,
-            t,
-            ground_truth,
-        )
-        delta_t = self._extract(
-            self.delta_schedule,
-            t,
-            ground_truth,
-        )
-        sigma_t = torch.sqrt(
-            delta_t.clamp_min(0.0)
-        )
-
-        target_objective = (
-            m_t * (coarse_hsi - ground_truth)
-            + sigma_t * noise
-        )
-
-        x_t = ground_truth + target_objective
-
-        return (
-            x_t,
-            target_objective,
-            noise,
-        )
-
-    @staticmethod
-    def predict_x0_from_objective(
-        x_t: torch.Tensor,
-        predicted_objective: torch.Tensor,
-    ) -> torch.Tensor:
-        return x_t - predicted_objective
-
-    def training_predictions(
+    def forward(
         self,
         rgb: torch.Tensor,
-        coarse_hsi: torch.Tensor,
         ground_truth: torch.Tensor,
-        t: Optional[torch.Tensor] = None,
-        noise: Optional[torch.Tensor] = None,
-    ) -> dict[str, torch.Tensor]:
-        batch_size = ground_truth.shape[0]
+        context: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        coarse = self.coarse_estimate(rgb)
+        self._validate_endpoints(coarse, ground_truth)
 
-        if t is None:
-            t = torch.randint(
-                1,
-                self.num_timesteps + 1,
-                (batch_size,),
-                device=ground_truth.device,
-                dtype=torch.long,
-            )
-
-        (
-            x_t,
-            target_objective,
-            used_noise,
-        ) = self.q_sample(
-            ground_truth=ground_truth,
-            coarse_hsi=coarse_hsi,
-            t=t,
-            noise=noise,
+        loss, log_dict = self.bridge(
+            x=ground_truth,
+            y=coarse,
+            context=context,
         )
-
-        predicted_objective = self.denoiser(
-            x_t=x_t,
-            coarse_hsi=coarse_hsi,
-            rgb=rgb,
-            t=t,
-            total_steps=self.num_timesteps,
-        )
-
-        reconstruction = (
-            self.predict_x0_from_objective(
-                x_t=x_t,
-                predicted_objective=predicted_objective,
-            )
-        )
-
-        return {
-            "t": t,
-            "x_t": x_t,
-            "noise": used_noise,
-            "target_objective": target_objective,
-            "predicted_objective": predicted_objective,
-            "reconstruction": reconstruction,
-        }
+        log_dict["coarse_estimate"] = coarse
+        return loss, log_dict
 
     @torch.no_grad()
     def sample(
         self,
         rgb: torch.Tensor,
-        coarse_hsi: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
         clip_denoised: bool = True,
-        stochastic: bool = False,
-    ) -> torch.Tensor:
-        x_t = coarse_hsi.clone()
-        endpoint = coarse_hsi
-        batch_size = coarse_hsi.shape[0]
-
-        for step in range(
-            self.num_timesteps,
-            0,
-            -1,
-        ):
-            t = torch.full(
-                (batch_size,),
-                step,
-                device=coarse_hsi.device,
-                dtype=torch.long,
-            )
-
-            predicted_objective = self.denoiser(
-                x_t=x_t,
-                coarse_hsi=coarse_hsi,
-                rgb=rgb,
-                t=t,
-                total_steps=self.num_timesteps,
-            )
-
-            x0_hat = self.predict_x0_from_objective(
-                x_t=x_t,
-                predicted_objective=predicted_objective,
-            )
-
-            if clip_denoised:
-                x0_hat = x0_hat.clamp(
-                    0.0,
-                    1.0,
-                )
-
-            if step == 1:
-                x_t = x0_hat
-                break
-
-            previous_t = torch.full_like(
-                t,
-                step - 1,
-            )
-
-            m_t = self._extract(
-                self.m_schedule,
-                t,
-                x_t,
-            )
-            delta_t = self._extract(
-                self.delta_schedule,
-                t,
-                x_t,
-            )
-            m_previous = self._extract(
-                self.m_schedule,
-                previous_t,
-                x_t,
-            )
-            delta_previous = self._extract(
-                self.delta_schedule,
-                previous_t,
-                x_t,
-            )
-
-            previous_bridge_mean = (
-                (1.0 - m_previous) * x0_hat
-                + m_previous * endpoint
-            )
-
-            # The endpoint at t=T is deterministic because delta_T=0.
-            if step == self.num_timesteps:
-                posterior_mean = previous_bridge_mean
-                posterior_variance = delta_previous
-            else:
-                denominator = (
-                    1.0 - m_previous
-                ).clamp_min(1e-8)
-
-                transition_scale = (
-                    (1.0 - m_t) / denominator
-                )
-
-                transition_variance = (
-                    delta_t
-                    - transition_scale.square()
-                    * delta_previous
-                ).clamp_min(1e-12)
-
-                posterior_mean = (
-                    (
-                        transition_variance
-                        / delta_t.clamp_min(1e-12)
-                    )
-                    * previous_bridge_mean
-                    + (
-                        transition_scale
-                        * delta_previous
-                        / delta_t.clamp_min(1e-12)
-                    )
-                    * (
-                        x_t
-                        - (1.0 - transition_scale)
-                        * endpoint
-                    )
-                )
-
-                posterior_variance = (
-                    delta_previous
-                    * transition_variance
-                    / delta_t.clamp_min(1e-12)
-                ).clamp_min(0.0)
-
-            if stochastic:
-                x_t = (
-                    posterior_mean
-                    + torch.sqrt(posterior_variance)
-                    * torch.randn_like(x_t)
-                )
-            else:
-                x_t = posterior_mean
-
-        return x_t
-
-
-# ============================================================================
-# Complete MST++ + BBDM model
-# ============================================================================
-
-class MSTPlusPlusBBDM(nn.Module):
-    def __init__(
-        self,
-        bridge: BrownianBridgeDiffusion,
-        coarse_model: Optional[nn.Module] = None,
-        coarse_checkpoint: Optional[str | Path] = None,
-        coarse_model_kwargs: Optional[dict[str, Any]] = None,
-        freeze_coarse_model: bool = True,
-        strict_checkpoint_loading: bool = True,
-    ):
-        super().__init__()
-
-        if coarse_model is None:
-            coarse_model = MST_Plus_Plus(
-                **(coarse_model_kwargs or {})
-            )
-
-        self.coarse_model = coarse_model
-        self.bridge = bridge
-        self.freeze_coarse_model = freeze_coarse_model
-
-        if coarse_checkpoint is not None:
-            checkpoint = _load_checkpoint(
-                coarse_checkpoint
-            )
-            state_dict = _extract_state_dict(
-                checkpoint
-            )
-
-            self.coarse_model.load_state_dict(
-                state_dict,
-                strict=strict_checkpoint_loading,
-            )
-
-        if self.freeze_coarse_model:
-            self.coarse_model.float()
-
-            for parameter in self.coarse_model.parameters():
-                parameter.requires_grad_(False)
-
-            self.coarse_model.eval()
-
-    def train(self, mode: bool = True):
-        super().train(mode)
-
-        if self.freeze_coarse_model:
-            self.coarse_model.eval()
-
-        return self
-
-    def get_coarse(
-        self,
-        rgb: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.freeze_coarse_model:
-            self.coarse_model.eval()
-
-            with torch.no_grad():
-                with torch.autocast(
-                    device_type=rgb.device.type,
-                    enabled=False,
-                ):
-                    coarse_output = self.coarse_model(
-                        rgb.detach()
-                        .float()
-                        .contiguous()
-                    )
-
-            coarse_hsi = _extract_tensor_output(
-                coarse_output
-            ).detach().float()
-        else:
-            coarse_hsi = _extract_tensor_output(
-                self.coarse_model(rgb)
-            )
-
-        coarse_hsi = coarse_hsi[
-            :,
-            :,
-            :rgb.shape[-2],
-            :rgb.shape[-1],
-        ]
-
-        return coarse_hsi.contiguous()
-
-    def forward(
-        self,
-        rgb: torch.Tensor,
-        ground_truth: torch.Tensor,
-        t: Optional[torch.Tensor] = None,
-    ) -> dict[str, torch.Tensor]:
-        coarse_hsi = self.get_coarse(rgb)
-
-        if coarse_hsi.shape != ground_truth.shape:
-            raise ValueError(
-                "The MST++ output and ground-truth HSI must have "
-                f"the same shape, but received {coarse_hsi.shape} "
-                f"and {ground_truth.shape}."
-            )
-
-        outputs = self.bridge.training_predictions(
-            rgb=rgb,
-            coarse_hsi=coarse_hsi,
-            ground_truth=ground_truth,
-            t=t,
-        )
-        outputs["coarse_hsi"] = coarse_hsi
-
-        return outputs
-
-    @torch.no_grad()
-    def reconstruct(
-        self,
-        rgb: torch.Tensor,
-        clip_denoised: bool = True,
-        stochastic: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        coarse_hsi = self.get_coarse(rgb)
-
-        refined_hsi = self.bridge.sample(
-            rgb=rgb,
-            coarse_hsi=coarse_hsi,
+        sample_mid_step: bool = False,
+    ) -> Union[
+        torch.Tensor,
+        Tuple[list[torch.Tensor], list[torch.Tensor]],
+    ]:
+        coarse = self.coarse_estimate(rgb)
+        return self.bridge.sample(
+            y=coarse,
+            context=context,
             clip_denoised=clip_denoised,
-            stochastic=stochastic,
+            sample_mid_step=sample_mid_step,
         )
 
-        return coarse_hsi, refined_hsi
+    def get_parameters(self) -> Iterable[nn.Parameter]:
+        return self.bridge.get_parameters()
 
 
-def build_mst_bbdm(
-    coarse_checkpoint: Optional[str | Path] = None,
-    coarse_model_kwargs: Optional[dict[str, Any]] = None,
-    hsi_channels: int = 31,
-    rgb_channels: int = 3,
-    n_feat: int = 31,
-    body_depth: int = 3,
-    mst_stage: int = 2,
-    num_blocks: Sequence[int] = (1, 1, 1),
-    num_timesteps: int = 50,
-    midpoint_variance: float = 0.05,
-    freeze_coarse_model: bool = True,
-) -> MSTPlusPlusBBDM:
-    denoiser = MSTBBDMDenoiser(
-        hsi_channels=hsi_channels,
-        rgb_channels=rgb_channels,
-        n_feat=n_feat,
-        body_depth=body_depth,
-        mst_stage=mst_stage,
-        num_blocks=num_blocks,
-    )
-
-    bridge = BrownianBridgeDiffusion(
-        denoiser=denoiser,
-        num_timesteps=num_timesteps,
-        midpoint_variance=midpoint_variance,
-    )
-
-    return MSTPlusPlusBBDM(
-        bridge=bridge,
-        coarse_model=None,
-        coarse_checkpoint=coarse_checkpoint,
-        coarse_model_kwargs=coarse_model_kwargs,
-        freeze_coarse_model=freeze_coarse_model,
-    )
+# Convenient alias for training scripts.
+Model = MSTPlusPlusBrownianBridge
