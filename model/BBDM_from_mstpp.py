@@ -29,13 +29,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_gradient_checkpoint
 from tqdm.autonotebook import tqdm
+
+MODEL_FILE_VERSION = "mstpp_bbdm_ampfix_v2_2026_07_07"
 
 
 # ---------------------------------------------------------------------------
 # EDIT THIS IMPORT TO MATCH YOUR MST++ IMPLEMENTATION.
 # Example:
-from .MST_Plus_Plus import MST_Plus_Plus
+from model.MST_Plus_Plus import MST_Plus_Plus
 # ---------------------------------------------------------------------------
 #try:
     #from model.mst_plus_plus import MST_Plus_Plus  # type: ignore
@@ -160,7 +163,7 @@ def checkpoint(
     del parameters
     if not enabled:
         return function(*inputs)
-    return torch.utils.checkpoint.checkpoint(  # type: ignore[attr-defined]
+    return torch_gradient_checkpoint(
         function,
         *inputs,
         use_reentrant=False,
@@ -1014,7 +1017,7 @@ def _get_config_value(
 
 def _strip_state_dict_prefixes(
     state_dict: dict[str, torch.Tensor],
-    prefixes: Sequence[str] = ("module.", "model.", "mst_plus_plus.", "mstpp."),
+    prefixes: Sequence[str] = ("module.", "model.", "mst_model.", "mst_plus_plus.", "mstpp."),
 ) -> dict[str, torch.Tensor]:
     cleaned = dict(state_dict)
     changed = True
@@ -1044,6 +1047,7 @@ def load_mstpp_checkpoint(
             "model_state_dict",
             "state_dict",
             "model",
+            "params",
         )
         state_dict = None
         for key in candidate_keys:
@@ -1189,12 +1193,56 @@ class MSTPlusPlusBrownianBridge(nn.Module):
             raise TypeError("Selected MST++ prediction is not a tensor.")
         return coarse
 
+    def _run_mstpp_float32(self, rgb_fp32: torch.Tensor) -> Any:
+        """Execute MST++ with autocast disabled."""
+        if rgb_fp32.device.type in {"cuda", "cpu"}:
+            with torch.autocast(
+                device_type=rgb_fp32.device.type,
+                enabled=False,
+            ):
+                return self.mstpp(rgb_fp32)
+        return self.mstpp(rgb_fp32)
+
     @torch.no_grad()
     def coarse_estimate(self, rgb: torch.Tensor) -> torch.Tensor:
+        """Run frozen MST++ in contiguous float32, outside bridge AMP.
+
+        The first attempt keeps cuDNN enabled for speed. If the Kaggle/PyTorch
+        build raises the known ``GET was unable to find an engine`` convolution
+        error, the same float32 forward is retried with cuDNN disabled. This
+        fallback affects only the frozen MST++ branch; bridge AMP remains active.
+        """
         self.mstpp.eval()
-        output = self.mstpp(rgb)
+        rgb_fp32 = (
+            rgb.detach()
+            .to(device=rgb.device, dtype=torch.float32)
+            .contiguous(memory_format=torch.contiguous_format)
+        )
+
+        try:
+            output = self._run_mstpp_float32(rgb_fp32)
+        except RuntimeError as error:
+            message = str(error).lower()
+            engine_error = (
+                "unable to find an engine" in message
+                or "get was unable" in message
+            )
+            if rgb_fp32.device.type != "cuda" or not engine_error:
+                raise
+
+            # Some Kaggle CUDA/cuDNN combinations cannot select a cuDNN engine
+            # for an MST++ depth-wise/positional convolution. Retry using the
+            # native CUDA convolution implementation instead of cuDNN.
+            torch.cuda.synchronize(rgb_fp32.device)
+            with torch.backends.cudnn.flags(enabled=False):
+                output = self._run_mstpp_float32(rgb_fp32)
+
         coarse = self._select_mstpp_output(output)
-        return coarse.detach()
+        return (
+            coarse.detach()
+            .to(device=rgb.device, dtype=torch.float32)
+            .contiguous(memory_format=torch.contiguous_format)
+        )
 
     def _validate_endpoints(
         self,
