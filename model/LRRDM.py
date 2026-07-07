@@ -423,7 +423,12 @@ class MSTPlusPlusLRDM(nn.Module):
         self.register_buffer("beta_step_sq", beta_step_sq, persistent=True)
 
     def _freeze_mst_model(self) -> None:
+        # Keep the pretrained MST++ branch frozen and in float32. Some CUDA/
+        # cuDNN builds cannot execute MST++ depthwise convolutions in BF16/FP16
+        # under autocast, which produces the "GET was unable to find an engine"
+        # error. The trainable LRDM denoiser may still use mixed precision.
         self.mst_model.requires_grad_(False)
+        self.mst_model.float()
         self.mst_model.eval()
 
     def train(self, mode: bool = True) -> "MSTPlusPlusLRDM":
@@ -434,7 +439,24 @@ class MSTPlusPlusLRDM(nn.Module):
 
     @torch.no_grad()
     def mst_reconstruction(self, rgb: Tensor) -> Tensor:
-        estimate = _extract_tensor(self.mst_model(rgb))
+        """Run frozen MST++ in a float32 autocast-disabled subregion.
+
+        ``training_predictions`` may be called from an outer AMP/autocast
+        region. ``torch.no_grad`` prevents gradients, but it does not disable
+        autocast. We therefore explicitly disable autocast here and cast the
+        RGB input to contiguous float32 before the MST++ forward pass.
+        """
+        self.mst_model.eval()
+        rgb_fp32 = rgb.detach().to(dtype=torch.float32).contiguous()
+
+        if rgb_fp32.device.type == "cuda":
+            with torch.autocast(device_type="cuda", enabled=False):
+                estimate = _extract_tensor(self.mst_model(rgb_fp32))
+        else:
+            estimate = _extract_tensor(self.mst_model(rgb_fp32))
+
+        estimate = estimate.detach().to(dtype=torch.float32).contiguous()
+
         if estimate.ndim != 4:
             raise ValueError(f"MST++ must return [B,C,H,W], got {tuple(estimate.shape)}")
         if estimate.shape[1] != self.hsi_channels:
