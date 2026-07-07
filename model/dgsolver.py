@@ -1628,14 +1628,24 @@ class MSTPlusPlusDGSolver(nn.Module):
         return self.mst_plus_plus.load_state_dict(cleaned_state, strict=strict)
 
     def coarse_estimate(self, rgb: torch.Tensor) -> torch.Tensor:
-        """Run the imported MST++ model and return its coarse HSI estimate."""
-        if self.freeze_mst:
-            with torch.no_grad():
-                output = self.mst_plus_plus(rgb)
-        else:
-            output = self.mst_plus_plus(rgb)
+        """Run MST++ in float32 and return its coarse HSI estimate.
 
-        coarse = self._extract_prediction(output)
+        MST++ contains convolution configurations that may not have a valid
+        cuDNN engine under FP16/BF16 autocast on some GPUs.  The refinement
+        network can still use AMP; only the frozen coarse branch is forced to
+        float32.
+        """
+        rgb_fp32 = rgb.detach().to(dtype=torch.float32).contiguous()
+
+        # Disable any autocast context inherited from the training script.
+        with torch.autocast(device_type=rgb.device.type, enabled=False):
+            if self.freeze_mst:
+                with torch.no_grad():
+                    output = self.mst_plus_plus(rgb_fp32)
+            else:
+                output = self.mst_plus_plus(rgb_fp32)
+
+        coarse = self._extract_prediction(output).float().contiguous()
 
         if coarse.ndim != 4:
             raise ValueError(
