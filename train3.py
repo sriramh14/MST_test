@@ -107,7 +107,7 @@ TRAIN_PAIR_VALIDATION_CACHE = OUTPUT_DIR / "training_pair_validation_cache.pth"
 VALIDATION_PAIR_VALIDATION_CACHE = OUTPUT_DIR / "validation_pair_validation_cache.pth"
 
 # Brownian bridge settings.
-NUM_TIMESTEPS = 1000
+NUM_TIMESTEPS = 100
 MT_TYPE = "linear"
 MAX_VARIANCE = 1.0
 SAMPLING_ETA = 0.0
