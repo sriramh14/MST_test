@@ -129,8 +129,8 @@ PRINT_EVERY = 30
 SEED = 42
 
 # AMP settings.
-USE_AMP = True
-PREFER_BFLOAT16 = True
+USE_AMP = False  # MST++ depthwise pos_emb Conv2d may lack a CUDA AMP engine
+PREFER_BFLOAT16 = False
 FP16_INITIAL_SCALE = 1024.0
 FP16_GROWTH_INTERVAL = 2000
 
