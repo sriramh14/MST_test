@@ -35,7 +35,7 @@ WEIGHT_DECAY = 0.0
 PATCH_SIZE = 128          # use 256 for full-image training
 USE_RANDOM_CROP = True
 
-MODEL_STAGE = 3
+MODEL_STAGE = 1
 USE_AMP = True
 GRAD_CLIP = 1.0
 SEED = 42
