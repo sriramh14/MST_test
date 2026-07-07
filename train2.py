@@ -135,10 +135,9 @@ FP16_INITIAL_SCALE = 1024.0
 FP16_GROWTH_INTERVAL = 2000
 
 # Metric/loss safety settings.
+# This exact definition is used for BOTH optimization and validation MRAE.
+# Keeping it internal avoids a silent mismatch with loss/mrae.py.
 MRAE_EPSILON = 1e-3
-# Set True to bypass the imported mrae() implementation and use the stable
-# denominator below for both training and validation MRAE.
-USE_STABLE_INTERNAL_MRAE = False
 
 # Metadata validation caches.
 TRAIN_PAIR_VALIDATION_CACHE = OUTPUT_DIR / "training_pair_validation_cache.pth"
@@ -933,15 +932,38 @@ def model_config_dict() -> dict:
     }
 
 
+def mrae_per_sample(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Return one stable MRAE value per BCHW image.
+
+    MRAE = mean(|prediction - target| / max(|target|, epsilon)).
+    The calculation is always performed in float32.
+    """
+    if prediction.shape != target.shape:
+        raise ValueError(
+            f"MRAE shape mismatch: prediction={tuple(prediction.shape)}, "
+            f"target={tuple(target.shape)}"
+        )
+    if prediction.ndim != 4:
+        raise ValueError(
+            f"MRAE expects BCHW tensors, found {prediction.ndim} dimensions."
+        )
+
+    prediction = prediction.float()
+    target = target.float()
+    denominator = target.abs().clamp_min(MRAE_EPSILON)
+    relative_error = (prediction - target).abs() / denominator
+    return relative_error.mean(dim=(1, 2, 3))
+
+
 def stable_mrae(
     target: torch.Tensor,
     prediction: torch.Tensor,
 ) -> torch.Tensor:
-    target = target.float()
-    prediction = prediction.float()
-    denominator = target.abs().clamp_min(MRAE_EPSILON)
-    return ((prediction - target).abs() / denominator).mean()
-
+    """Backward-compatible scalar MRAE wrapper."""
+    return mrae_per_sample(prediction=prediction, target=target).mean()
 
 def _scalar_metric(value: Any, name: str) -> torch.Tensor:
     if not torch.is_tensor(value):
@@ -962,27 +984,22 @@ def calculate_mrae_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
 ) -> torch.Tensor:
-    if prediction.shape != target.shape:
-        raise ValueError(
-            f"MRAE shape mismatch: prediction={tuple(prediction.shape)}, "
-            f"target={tuple(target.shape)}"
-        )
-
-    # Calculate the loss outside autocast to avoid a small denominator being
-    # rounded or underflowing in FP16.
+    """Compute the exact MRAE training objective in float32."""
     with torch.autocast(
         device_type=prediction.device.type,
         enabled=False,
     ):
-        prediction_fp32 = prediction.float()
-        target_fp32 = target.float()
-        if USE_STABLE_INTERNAL_MRAE:
-            loss = stable_mrae(target_fp32, prediction_fp32)
-        else:
-            loss = _scalar_metric(
-                mrae(target_fp32, prediction_fp32),
-                "MRAE",
-            )
+        loss = mrae_per_sample(
+            prediction=prediction.float(),
+            target=target.float(),
+        ).mean()
+
+    if not torch.isfinite(loss):
+        raise FloatingPointError(f"MRAE returned a non-finite value: {loss}")
+    if prediction.requires_grad and not loss.requires_grad:
+        raise RuntimeError(
+            "MRAE loss is detached from the prediction graph and cannot train the model."
+        )
     return loss
 
 
@@ -1021,13 +1038,10 @@ def calculate_validation_metrics(
         sample_prediction = prediction[sample_index : sample_index + 1]
         sample_target = target[sample_index : sample_index + 1]
 
-        if USE_STABLE_INTERNAL_MRAE:
-            mrae_value = stable_mrae(sample_target, sample_prediction)
-        else:
-            mrae_value = _scalar_metric(
-                mrae(sample_target, sample_prediction),
-                "MRAE",
-            )
+        mrae_value = mrae_per_sample(
+            prediction=sample_prediction,
+            target=sample_target,
+        ).mean()
 
         metric_sums["mrae"] += float(mrae_value.detach().item())
         metric_sums["psnr"] += float(
@@ -1244,8 +1258,14 @@ def train_one_epoch(
         scaler.step(optimizer)
         scaler.update()
 
+        with torch.no_grad():
+            batch_mrae_values = mrae_per_sample(
+                prediction=prediction.detach(),
+                target=hsi,
+            )
+
         batch_size = hsi.shape[0]
-        loss_sum += float(loss.detach()) * batch_size
+        loss_sum += float(batch_mrae_values.sum().item())
         sample_count += batch_size
 
         if batch_index % PRINT_EVERY == 0 or batch_index == len(loader):
