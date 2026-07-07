@@ -35,12 +35,12 @@ from tqdm.autonotebook import tqdm
 # ---------------------------------------------------------------------------
 # EDIT THIS IMPORT TO MATCH YOUR MST++ IMPLEMENTATION.
 # Example:
-# from model.mst_plus_plus import MST_Plus_Plus
+from .MST_Plus_Plus import MST_Plus_Plus
 # ---------------------------------------------------------------------------
-try:
-    from .MST_Plus_Plus import MST_Plus_Plus  # type: ignore
-except ImportError:
-    MST_Plus_Plus = None
+#try:
+    #from model.mst_plus_plus import MST_Plus_Plus  # type: ignore
+#except ImportError:
+    #MST_Plus_Plus = None
 
 
 # ===========================================================================
