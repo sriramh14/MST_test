@@ -26,8 +26,7 @@ Training:
 Inference:
     prediction = model.sample(rgb)
 
-Validation reports MRAE, RMSE, SAM in degrees, PSNR, and SSIM over the complete
-validation loader. Visualization selects five random full-resolution validation
+Validation reports only one-step random-timestep objective/noise loss and x_t MRAE, matching the training objective. Visualization selects five random full-resolution validation
 pairs and saves a labelled RGB / ground truth / MST++ / BBDM comparison grid.
 """
 
@@ -54,7 +53,7 @@ from torch.utils.data import DataLoader, Dataset
 # -----------------------------------------------------------------------------
 # Change this import path to match your project structure.
 # -----------------------------------------------------------------------------
-from model.BBDM_from_mstpp import MSTPlusPlusBrownianBridge
+from model.BBDM_from_mstpp import MSTPlusPlusBrownianBridge, extract
 
 
 # =============================================================================
@@ -129,7 +128,7 @@ MAX_VARIANCE = 1.0
 SAMPLING_ETA = 0.0
 SKIP_SAMPLE = True
 SAMPLE_TYPE = "linear"
-SAMPLE_STEPS = 50
+SAMPLE_STEPS = 20
 LOSS_TYPE = "l1"
 OBJECTIVE = "grad"
 
@@ -161,7 +160,7 @@ USE_AUGMENTATION = True
 # Training settings.
 BATCH_SIZE = 2
 VALIDATION_BATCH_SIZE = 2
-NUM_EPOCHS = 35
+NUM_EPOCHS = 40
 LEARNING_RATE = 5e-5
 WEIGHT_DECAY = 1e-4
 MIN_LEARNING_RATE = 1e-7
@@ -188,7 +187,7 @@ SSIM_WINDOW_SIZE = 11
 SSIM_SIGMA = 1.5
 
 # Checkpoint selection. Lower validation MRAE is considered better.
-BEST_METRIC_NAME = "mrae"
+BEST_METRIC_NAME = "mrae"  # one-step x_t MRAE during validation
 
 # Visualization settings.
 NUM_VISUALIZATION_IMAGES = 5
@@ -1688,34 +1687,35 @@ def validate_one_epoch(
     device: torch.device,
 ) -> dict:
     """
-    Deterministic validation loss plus complete reverse-bridge metrics.
+    One-step random-timestep validation, matching the training objective.
 
-    Validation is intentionally float32:
-      * no autocast;
-      * no GradScaler;
-      * deterministic timestep/noise assignments;
-      * eta should normally be 0 for deterministic reverse sampling.
+    This deliberately does NOT run the full reverse Brownian-bridge sampler.
+    For each validation batch it:
+      1. obtains the frozen MST++ coarse endpoint y;
+      2. samples a random timestep t, like training;
+      3. creates the true noisy bridge state x_t;
+      4. predicts the bridge objective with one UNet call;
+      5. reports objective/noise loss and MRAE between predicted x_t and true x_t.
+
+    If OBJECTIVE == "noise", the reported noise_loss is literally the noise
+    prediction loss. If OBJECTIVE is "grad" or "ysubx", the same key is kept
+    for logging consistency, but it is the configured Brownian objective loss.
     """
     model.eval()
 
-    loss_sum = 0.0
-    metric_sums = {
-        "mrae": 0.0,
-        "rmse": 0.0,
-        "sam": 0.0,
-        "psnr": 0.0,
-        "ssim": 0.0,
-    }
+    noise_loss_sum = 0.0
+    xt_mrae_sum = 0.0
     sample_count = 0
-    sample_offset = 0
 
     try:
+        timestep_generator = torch.Generator(device=device)
         noise_generator = torch.Generator(device=device)
     except TypeError:
-        noise_generator = torch.Generator(
-            device=device.type
-        )
-    noise_generator.manual_seed(SEED + 10_000)
+        timestep_generator = torch.Generator(device=device.type)
+        noise_generator = torch.Generator(device=device.type)
+
+    timestep_generator.manual_seed(SEED + 10_000)
+    noise_generator.manual_seed(SEED + 20_000)
 
     for batch_index, (hsi, rgb) in enumerate(loader, start=1):
         hsi = hsi.to(
@@ -1733,17 +1733,14 @@ def validate_one_epoch(
         coarse = model.coarse_estimate(rgb).float()
         model._validate_endpoints(coarse, hsi)
 
-        timesteps = (
-            torch.arange(
-                sample_offset,
-                sample_offset + batch_size,
-                device=device,
-                dtype=torch.long,
-            )
-            % model.bridge.num_timesteps
+        timesteps = torch.randint(
+            low=0,
+            high=model.bridge.num_timesteps,
+            size=(batch_size,),
+            device=device,
+            generator=timestep_generator,
+            dtype=torch.long,
         )
-        sample_offset += batch_size
-
         noise = torch.randn(
             hsi.shape,
             generator=noise_generator,
@@ -1756,40 +1753,68 @@ def validate_one_epoch(
             if model.bridge.condition_key == "nocond"
             else coarse
         )
-        loss, _ = model.bridge.p_losses(
+
+        true_xt, objective = model.bridge.q_sample(
             x0=hsi,
             y=coarse,
-            context=context,
             t=timesteps,
             noise=noise,
         )
-
-        prediction = model.bridge.sample(
-            y=coarse,
+        objective_recon = model.bridge.denoise_fn(
+            true_xt,
+            timesteps=timesteps,
             context=context,
-            clip_denoised=False,
-            sample_mid_step=False,
         )
-        if not isinstance(prediction, torch.Tensor):
-            raise TypeError(
-                "Expected final Brownian bridge sample to be a tensor."
+
+        if model.bridge.loss_type == "l1":
+            noise_loss = (objective - objective_recon).abs().mean()
+        elif model.bridge.loss_type == "l2":
+            noise_loss = F.mse_loss(objective, objective_recon)
+        else:
+            raise NotImplementedError(
+                f"Unsupported validation loss type: {model.bridge.loss_type}"
             )
-        prediction = clamp_prediction(prediction.float())
 
-        batch_metrics = calculate_batch_metric_sums(
-            prediction=prediction,
-            target=hsi,
+        # Convert the predicted objective back to an x0 estimate, then rebuild
+        # the timestep state using the SAME y, t, and noise used to create the
+        # true x_t. This gives the requested predicted-x_t vs actual-x_t error.
+        predicted_x0 = model.bridge.predict_x0_from_objective(
+            x_t=true_xt,
+            y=coarse,
+            t=timesteps,
+            objective_recon=objective_recon,
+        )
+        m_t = extract(model.bridge.m_t, timesteps, hsi.shape)
+        var_t = extract(model.bridge.variance_t, timesteps, hsi.shape)
+        sigma_t = torch.sqrt(var_t)
+        predicted_xt = (
+            (1.0 - m_t) * predicted_x0
+            + m_t * coarse
+            + sigma_t * noise
         )
 
-        loss_sum += float(loss.detach()) * batch_size
-        for key in metric_sums:
-            metric_sums[key] += batch_metrics[key]
+        xt_mrae = torch.mean(
+            torch.abs(predicted_xt - true_xt)
+            / (torch.abs(true_xt) + MRAE_EPSILON)
+        )
+
+        if not torch.isfinite(noise_loss):
+            raise FloatingPointError(
+                f"Validation noise/objective loss is non-finite at batch {batch_index}."
+            )
+        if not torch.isfinite(xt_mrae):
+            raise FloatingPointError(
+                f"Validation x_t MRAE is non-finite at batch {batch_index}."
+            )
+
+        noise_loss_sum += float(noise_loss.detach()) * batch_size
+        xt_mrae_sum += float(xt_mrae.detach()) * batch_size
         sample_count += batch_size
 
         print(
             f"  Validation batch {batch_index:04d}/{len(loader):04d} | "
-            f"running MRAE={metric_sums['mrae'] / sample_count:.6f} | "
-            f"PSNR={metric_sums['psnr'] / sample_count:.3f} dB"
+            f"noise/objective loss={noise_loss_sum / sample_count:.6f} | "
+            f"x_t MRAE={xt_mrae_sum / sample_count:.6f}"
         )
 
     if sample_count == 0:
@@ -1798,11 +1823,10 @@ def validate_one_epoch(
         )
 
     return {
-        "loss": loss_sum / sample_count,
-        **{
-            key: value / sample_count
-            for key, value in metric_sums.items()
-        },
+        "loss": noise_loss_sum / sample_count,
+        "noise_loss": noise_loss_sum / sample_count,
+        "mrae": xt_mrae_sum / sample_count,
+        "xt_mrae": xt_mrae_sum / sample_count,
         "evaluated_images": sample_count,
     }
 
@@ -1972,13 +1996,10 @@ def run_training(
             f"val loss={validation_metrics['loss']:.6f}"
         )
         print(
-            "Validation reconstruction metrics "
+            "Validation one-step random-timestep metrics "
             f"({validation_metrics['evaluated_images']} images) | "
-            f"MRAE={validation_metrics['mrae']:.6f} | "
-            f"RMSE={validation_metrics['rmse']:.6f} | "
-            f"SAM={validation_metrics['sam']:.4f} deg | "
-            f"PSNR={validation_metrics['psnr']:.4f} dB | "
-            f"SSIM={validation_metrics['ssim']:.6f}"
+            f"noise/objective loss={validation_metrics['noise_loss']:.6f} | "
+            f"x_t MRAE={validation_metrics['mrae']:.6f}"
         )
 
         current_metric = float(
