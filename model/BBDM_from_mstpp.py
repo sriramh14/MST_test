@@ -778,7 +778,7 @@ class UNetModel(nn.Module):
             h = torch.cat([h, skips.pop()], dim=1)
             h = module(h, embeddings, context)
 
-        return self.out(h).to(dtype=x.dtype)
+        return (self.out(h)+x).to(dtype=x.dtype)
 
 
 # ===========================================================================
