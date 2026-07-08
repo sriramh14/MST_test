@@ -20,6 +20,7 @@ Edit the MST++ import below to match your project.
 from __future__ import annotations
 
 import math
+import inspect
 from abc import abstractmethod
 from functools import partial
 from pathlib import Path
@@ -32,18 +33,18 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as torch_gradient_checkpoint
 from tqdm.autonotebook import tqdm
 
-MODEL_FILE_VERSION = "mstpp_bbdm_ampfix_v2_2026_07_07"
+MODEL_FILE_VERSION = "mstpp_bbdm_stageconfig_v3_2026_07_08"
 
 
 # ---------------------------------------------------------------------------
 # EDIT THIS IMPORT TO MATCH YOUR MST++ IMPLEMENTATION.
 # Example:
-from model.MST_Plus_Plus import MST_Plus_Plus
+from .MST_Plus_Plus import MST_Plus_Plus
 # ---------------------------------------------------------------------------
 #try:
-    #from model.mst_plus_plus import MST_Plus_Plus  # type: ignore
+    #from .MST_Plus_Plus import MST_Plus_Plus  # type: ignore
 #except ImportError:
-    #MST_Plus_Plus = None
+   # MST_Plus_Plus = None
 
 
 # ===========================================================================
@@ -1073,6 +1074,79 @@ def load_mstpp_checkpoint(
     return list(incompatible.missing_keys), list(incompatible.unexpected_keys)
 
 
+
+def instantiate_mstpp_from_config(
+    factory: Callable[..., nn.Module],
+    mstpp_params: dict[str, Any],
+) -> nn.Module:
+    """
+    Instantiate MST++ while allowing the training script to control the number
+    of stages without hard-coding the constructor argument name.
+
+    The training config can pass:
+        "__mstpp_num_stages__": 1
+        "__mstpp_stage_arg_name__": None
+
+    If the explicit name is None, this function tries common constructor names:
+        stage, stages, num_stages, n_stages, num_stage
+
+    The internal keys are removed before the MST++ constructor is called.
+    """
+    params = dict(mstpp_params)
+
+    stage_value = params.pop("__mstpp_num_stages__", None)
+    explicit_stage_name = params.pop("__mstpp_stage_arg_name__", None)
+
+    if stage_value is None:
+        return factory(**params)
+
+    stage_aliases = (
+        [explicit_stage_name]
+        if explicit_stage_name is not None
+        else ["stage", "stages", "num_stages", "n_stages", "num_stage"]
+    )
+
+    try:
+        signature = inspect.signature(factory)
+        parameters = signature.parameters
+        accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        valid_names = set(parameters)
+    except (TypeError, ValueError):
+        # Some factory callables/classes may not expose a Python signature.
+        accepts_kwargs = True
+        valid_names = set()
+
+    already_configured = any(
+        alias is not None and alias in params
+        for alias in stage_aliases
+    )
+    if not already_configured:
+        selected_name = None
+        for alias in stage_aliases:
+            if alias is None:
+                continue
+            if accepts_kwargs or alias in valid_names:
+                selected_name = alias
+                break
+
+        if selected_name is None:
+            raise TypeError(
+                "MST_STAGES was set in the training script, but the MST++ "
+                "constructor does not appear to accept any of these stage "
+                f"argument names: {stage_aliases}. Set "
+                "MST_STAGE_PARAMETER_NAME to the exact constructor argument "
+                "used by your MST++ implementation, or pass the stage value "
+                "directly in MST_MODEL_KWARGS."
+            )
+
+        params[selected_name] = stage_value
+
+    return factory(**params)
+
+
 class MSTPlusPlusBrownianBridge(nn.Module):
     """
     Complete RGB -> frozen MST++ coarse HSI -> Brownian bridge refinement model.
@@ -1128,7 +1202,7 @@ class MSTPlusPlusBrownianBridge(nn.Module):
                     "MST++ could not be imported. Edit the import near the top "
                     "of this file, or pass mstpp_model/mstpp_factory explicitly."
                 )
-            self.mstpp = factory(**mstpp_params)
+            self.mstpp = instantiate_mstpp_from_config(factory, mstpp_params)
 
         checkpoint_path = _get_config_value(mstpp_config, "checkpoint_path")
         strict_load = bool(_get_config_value(mstpp_config, "strict_load", True))
