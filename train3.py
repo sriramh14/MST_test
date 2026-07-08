@@ -79,6 +79,22 @@ VALIDATION_RGB_DIR = (
 )
 
 MST_CHECKPOINT = "./mst_checkpoints/mst_plus_plus.pth"
+
+# Set this to match the MST++ checkpoint architecture.
+# For a trained single-stage MST++ checkpoint, keep this as 1.
+# For the common three-stage MST++ model, set this to 3.
+MST_NUM_STAGES = 1
+
+# Leave this as None for automatic detection. If your MST++ class uses a
+# specific constructor keyword, set it explicitly, for example:
+#   MST_STAGE_PARAMETER_NAME = "stage"
+#   MST_STAGE_PARAMETER_NAME = "num_stages"
+#   MST_STAGE_PARAMETER_NAME = "stages"
+#   MST_STAGE_PARAMETER_NAME = "n_stages"
+MST_STAGE_PARAMETER_NAME: Optional[str] = None
+
+# Other arguments passed to MST_Plus_Plus. Do not duplicate the stage-count
+# argument here unless you intentionally want to override MST_NUM_STAGES.
 MST_MODEL_KWARGS: Dict[str, Any] = {}
 STRICT_MST_CHECKPOINT = True
 MST_OUTPUT_KEY: Optional[str] = None
@@ -113,19 +129,19 @@ MAX_VARIANCE = 1.0
 SAMPLING_ETA = 0.0
 SKIP_SAMPLE = True
 SAMPLE_TYPE = "linear"
-SAMPLE_STEPS = 10
+SAMPLE_STEPS = 50
 LOSS_TYPE = "l1"
 OBJECTIVE = "grad"
 
 # BBDM UNet settings.
 TRAIN_CROP_SIZE = 256
 VALIDATION_CROP_SIZE: Optional[int] = TRAIN_CROP_SIZE
-UNET_MODEL_CHANNELS = 32
+UNET_MODEL_CHANNELS = 64
 UNET_NUM_RES_BLOCKS = 2
 UNET_ATTENTION_RESOLUTIONS = (8,)
-UNET_CHANNEL_MULT = (1, 2, 4)
+UNET_CHANNEL_MULT = (1, 2, 4, 4)
 UNET_DROPOUT = 0.0
-UNET_NUM_HEADS = 2
+UNET_NUM_HEADS = 4
 UNET_NUM_HEAD_CHANNELS = -1
 UNET_USE_CHECKPOINT = False
 UNET_USE_SCALE_SHIFT_NORM = True
@@ -145,7 +161,7 @@ USE_AUGMENTATION = True
 # Training settings.
 BATCH_SIZE = 2
 VALIDATION_BATCH_SIZE = 2
-NUM_EPOCHS = 40
+NUM_EPOCHS = 35
 LEARNING_RATE = 5e-5
 WEIGHT_DECAY = 1e-4
 MIN_LEARNING_RATE = 1e-7
@@ -243,6 +259,8 @@ def build_model_config() -> ConfigNode:
         output_key=MST_OUTPUT_KEY,
         output_index=MST_OUTPUT_INDEX,
         params=MST_MODEL_KWARGS,
+        num_stages=MST_NUM_STAGES,
+        stage_parameter_name=MST_STAGE_PARAMETER_NAME,
     )
 
     return ConfigNode(
@@ -1476,6 +1494,8 @@ def model_config_dictionary() -> dict:
         "unet_channel_mult": UNET_CHANNEL_MULT,
         "condition_key": CONDITION_KEY,
         "mst_checkpoint": MST_CHECKPOINT,
+        "mst_num_stages": MST_NUM_STAGES,
+        "mst_stage_parameter_name": MST_STAGE_PARAMETER_NAME,
     }
 
 
@@ -1916,6 +1936,8 @@ def run_training(
         f"Validation pairs: {len(validation_pairs)}\n"
         f"Training samples per epoch: {len(train_dataset)}\n"
         f"Frozen MST++ parameters: {frozen_parameters:,}\n"
+        f"MST++ stages: {MST_NUM_STAGES} "
+        f"({MST_STAGE_PARAMETER_NAME or 'auto keyword'})\n"
         f"Trainable bridge parameters: {trainable_count:,}\n"
         f"Bridge timesteps: {NUM_TIMESTEPS}\n"
         f"Reverse sampling steps: {len(model.bridge.steps)}"
