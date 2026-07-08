@@ -91,7 +91,7 @@ MST_NUM_STAGES = 1
 #   MST_STAGE_PARAMETER_NAME = "num_stages"
 #   MST_STAGE_PARAMETER_NAME = "stages"
 #   MST_STAGE_PARAMETER_NAME = "n_stages"
-MST_STAGE_PARAMETER_NAME: Optional[str] = None
+MST_STAGE_PARAMETER_NAME: Optional[str] = "stage"
 
 # Other arguments passed to MST_Plus_Plus. Do not duplicate the stage-count
 # argument here unless you intentionally want to override MST_NUM_STAGES.
@@ -150,7 +150,7 @@ UNET_RESBLOCK_UPDOWN = False
 # "nocond" keeps the UNet unconditioned while y still remains the Brownian
 # bridge endpoint in every q/p equation. Change this only when you explicitly
 # want the coarse cube additionally injected through the UNet context path.
-CONDITION_KEY = "nocond"
+CONDITION_KEY = "cond"
 
 MODEL_DOWNSAMPLE_FACTOR = 2 ** (len(UNET_CHANNEL_MULT) - 1)
 
