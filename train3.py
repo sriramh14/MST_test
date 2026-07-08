@@ -187,7 +187,7 @@ SSIM_WINDOW_SIZE = 11
 SSIM_SIGMA = 1.5
 
 # Checkpoint selection. Lower validation MRAE is considered better.
-BEST_METRIC_NAME = "mrae"  # one-step x_t MRAE during validation
+BEST_METRIC_NAME = "loss"  # one-step x_t MRAE during validation
 
 # Visualization settings.
 NUM_VISUALIZATION_IMAGES = 5
