@@ -19,8 +19,8 @@ Edit the MST++ import below to match your project.
 
 from __future__ import annotations
 
-import math
 import inspect
+import math
 from abc import abstractmethod
 from functools import partial
 from pathlib import Path
@@ -33,8 +33,6 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as torch_gradient_checkpoint
 from tqdm.autonotebook import tqdm
 
-MODEL_FILE_VERSION = "mstpp_bbdm_stageconfig_v3_2026_07_08"
-
 
 # ---------------------------------------------------------------------------
 # EDIT THIS IMPORT TO MATCH YOUR MST++ IMPLEMENTATION.
@@ -42,9 +40,9 @@ MODEL_FILE_VERSION = "mstpp_bbdm_stageconfig_v3_2026_07_08"
 from .MST_Plus_Plus import MST_Plus_Plus
 # ---------------------------------------------------------------------------
 #try:
-    #from .MST_Plus_Plus import MST_Plus_Plus  # type: ignore
+    #from model.mst_plus_plus import MST_Plus_Plus  # type: ignore
 #except ImportError:
-   # MST_Plus_Plus = None
+    #MST_Plus_Plus = None
 
 
 # ===========================================================================
@@ -1034,6 +1032,98 @@ def _strip_state_dict_prefixes(
     return cleaned
 
 
+
+MST_STAGE_PARAMETER_ALIASES = ("stage", "num_stages", "stages", "n_stages")
+
+
+def _callable_accepts_parameter(
+    factory: Callable[..., nn.Module],
+    parameter_name: str,
+) -> bool:
+    try:
+        signature = inspect.signature(factory)
+    except (TypeError, ValueError):
+        return False
+
+    parameters = signature.parameters
+    if parameter_name in parameters:
+        return True
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+
+
+def _instantiate_mstpp_with_stage_config(
+    factory: Callable[..., nn.Module],
+    mstpp_params: dict[str, Any],
+    num_stages: Optional[int] = None,
+    stage_parameter_name: Optional[str] = None,
+) -> nn.Module:
+    """Instantiate MST++ while making the number of stages configurable.
+
+    Different MST++ codebases use slightly different constructor names for the
+    stage count. This helper supports an explicit name through
+    `stage_parameter_name`; otherwise it tries common names and falls back to
+    `stage`, which is the name used in many MST++ implementations.
+    """
+    params = dict(mstpp_params)
+
+    if num_stages is None:
+        return factory(**params)
+
+    if int(num_stages) < 1:
+        raise ValueError(f"MST++ num_stages must be >= 1, got {num_stages}.")
+    num_stages = int(num_stages)
+
+    already_configured = [
+        alias for alias in MST_STAGE_PARAMETER_ALIASES
+        if alias in params
+    ]
+    if already_configured and stage_parameter_name is None:
+        # Respect an explicitly provided constructor kwarg in params.
+        return factory(**params)
+
+    if stage_parameter_name is not None:
+        params[stage_parameter_name] = num_stages
+        return factory(**params)
+
+    preferred_name = None
+    for alias in MST_STAGE_PARAMETER_ALIASES:
+        if _callable_accepts_parameter(factory, alias):
+            preferred_name = alias
+            break
+    if preferred_name is None:
+        preferred_name = "stage"
+
+    params[preferred_name] = num_stages
+    try:
+        return factory(**params)
+    except TypeError as first_error:
+        # Some classes hide their real signature or use a wrapper. Try the
+        # common aliases before giving up.
+        base_params = {
+            key: value
+            for key, value in params.items()
+            if key not in MST_STAGE_PARAMETER_ALIASES
+        }
+        last_error = first_error
+        for alias in MST_STAGE_PARAMETER_ALIASES:
+            trial_params = dict(base_params)
+            trial_params[alias] = num_stages
+            try:
+                return factory(**trial_params)
+            except TypeError as error:
+                last_error = error
+
+        raise TypeError(
+            "Could not instantiate MST++ with a configurable stage count. "
+            "Set MST_STAGE_PARAMETER_NAME in the training script to the exact "
+            "constructor keyword used by your MST++ class, for example "
+            "'stage', 'num_stages', 'stages', or 'n_stages'."
+        ) from last_error
+
+
 def load_mstpp_checkpoint(
     model: nn.Module,
     checkpoint_path: Union[str, Path],
@@ -1074,79 +1164,6 @@ def load_mstpp_checkpoint(
     return list(incompatible.missing_keys), list(incompatible.unexpected_keys)
 
 
-
-def instantiate_mstpp_from_config(
-    factory: Callable[..., nn.Module],
-    mstpp_params: dict[str, Any],
-) -> nn.Module:
-    """
-    Instantiate MST++ while allowing the training script to control the number
-    of stages without hard-coding the constructor argument name.
-
-    The training config can pass:
-        "__mstpp_num_stages__": 1
-        "__mstpp_stage_arg_name__": None
-
-    If the explicit name is None, this function tries common constructor names:
-        stage, stages, num_stages, n_stages, num_stage
-
-    The internal keys are removed before the MST++ constructor is called.
-    """
-    params = dict(mstpp_params)
-
-    stage_value = params.pop("__mstpp_num_stages__", None)
-    explicit_stage_name = params.pop("__mstpp_stage_arg_name__", None)
-
-    if stage_value is None:
-        return factory(**params)
-
-    stage_aliases = (
-        [explicit_stage_name]
-        if explicit_stage_name is not None
-        else ["stage", "stages", "num_stages", "n_stages", "num_stage"]
-    )
-
-    try:
-        signature = inspect.signature(factory)
-        parameters = signature.parameters
-        accepts_kwargs = any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters.values()
-        )
-        valid_names = set(parameters)
-    except (TypeError, ValueError):
-        # Some factory callables/classes may not expose a Python signature.
-        accepts_kwargs = True
-        valid_names = set()
-
-    already_configured = any(
-        alias is not None and alias in params
-        for alias in stage_aliases
-    )
-    if not already_configured:
-        selected_name = None
-        for alias in stage_aliases:
-            if alias is None:
-                continue
-            if accepts_kwargs or alias in valid_names:
-                selected_name = alias
-                break
-
-        if selected_name is None:
-            raise TypeError(
-                "MST_STAGES was set in the training script, but the MST++ "
-                "constructor does not appear to accept any of these stage "
-                f"argument names: {stage_aliases}. Set "
-                "MST_STAGE_PARAMETER_NAME to the exact constructor argument "
-                "used by your MST++ implementation, or pass the stage value "
-                "directly in MST_MODEL_KWARGS."
-            )
-
-        params[selected_name] = stage_value
-
-    return factory(**params)
-
-
 class MSTPlusPlusBrownianBridge(nn.Module):
     """
     Complete RGB -> frozen MST++ coarse HSI -> Brownian bridge refinement model.
@@ -1157,6 +1174,14 @@ class MSTPlusPlusBrownianBridge(nn.Module):
 
         model_config.MSTPP.params (optional)
             Keyword arguments used to construct MST_Plus_Plus.
+
+        model_config.MSTPP.num_stages (optional)
+            Number of MST++ stages. Useful when loading a single-stage
+            checkpoint. The wrapper injects this into the MST++ constructor.
+
+        model_config.MSTPP.stage_parameter_name (optional)
+            Exact constructor keyword for the stage count. If omitted, the
+            wrapper tries common names: stage, num_stages, stages, n_stages.
 
         model_config.MSTPP.checkpoint_path
             Path to the pretrained MST++ checkpoint.
@@ -1202,7 +1227,19 @@ class MSTPlusPlusBrownianBridge(nn.Module):
                     "MST++ could not be imported. Edit the import near the top "
                     "of this file, or pass mstpp_model/mstpp_factory explicitly."
                 )
-            self.mstpp = instantiate_mstpp_from_config(factory, mstpp_params)
+            mstpp_num_stages = _get_config_value(mstpp_config, "num_stages")
+            mstpp_stage_parameter_name = _get_config_value(
+                mstpp_config,
+                "stage_parameter_name",
+            )
+            self.mstpp_num_stages = mstpp_num_stages
+            self.mstpp_stage_parameter_name = mstpp_stage_parameter_name
+            self.mstpp = _instantiate_mstpp_with_stage_config(
+                factory=factory,
+                mstpp_params=mstpp_params,
+                num_stages=mstpp_num_stages,
+                stage_parameter_name=mstpp_stage_parameter_name,
+            )
 
         checkpoint_path = _get_config_value(mstpp_config, "checkpoint_path")
         strict_load = bool(_get_config_value(mstpp_config, "strict_load", True))
