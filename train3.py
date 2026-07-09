@@ -160,7 +160,7 @@ USE_AUGMENTATION = True
 # Training settings.
 BATCH_SIZE = 2
 VALIDATION_BATCH_SIZE = 2
-NUM_EPOCHS = 10
+NUM_EPOCHS = 30
 LEARNING_RATE = 5e-5
 WEIGHT_DECAY = 1e-4
 MIN_LEARNING_RATE = 1e-7
@@ -2320,6 +2320,162 @@ def run_visualization(
 
 
 # =============================================================================
+# Full validation-set inference (full reverse Brownian Bridge sampling)
+# =============================================================================
+
+@torch.no_grad()
+def evaluate_full_validation_inference(
+    model: MSTPlusPlusBrownianBridge,
+    validation_pairs: Sequence[Tuple[Path, Path]],
+    device: torch.device,
+) -> Dict[str, float]:
+    """
+    Run full inference (complete Brownian Bridge reverse sampling, not the
+    one-step random-timestep objective used during training/validation) over
+    every image in the validation set, at full resolution.
+
+    For each validation pair this mirrors run_visualization():
+      1. load the RGB/HSI pair via the existing dataset class;
+      2. pad to a multiple of MODEL_DOWNSAMPLE_FACTOR via pad_pair_to_multiple();
+      3. compute the frozen MST++ coarse estimate;
+      4. run the full reverse sampler via model.bridge.sample(...);
+      5. clamp the prediction via the existing clamp_prediction() helper;
+      6. crop back to the original resolution;
+      7. compute MRAE/RMSE/SAM/PSNR/SSIM via calculate_single_image_metrics().
+
+    Metrics are accumulated and averaged over the full validation dataset,
+    then printed as a summary.
+    """
+    model.eval()
+    if not validation_pairs:
+        raise RuntimeError(
+            "The validation pair list is empty."
+        )
+
+    dataset = HSIRGBPairDataset(
+        pairs=validation_pairs,
+        hsi_channels=HSI_CHANNELS,
+        crop_size=None,
+        patches_per_image=1,
+        training=False,
+        normalization=HSI_NORMALIZATION,
+        augment=False,
+        return_paths=True,
+    )
+
+    metric_sums = {
+        "mrae": 0.0,
+        "rmse": 0.0,
+        "sam": 0.0,
+        "psnr": 0.0,
+        "ssim": 0.0,
+    }
+    evaluated_images = 0
+
+    print(
+        f"\nRunning full-resolution inference over {len(dataset)} "
+        "validation images (complete Brownian Bridge reverse sampling)..."
+    )
+
+    for dataset_index in range(len(dataset)):
+        hsi, rgb, hsi_path_string, _ = dataset[dataset_index]
+
+        (
+            padded_hsi,
+            padded_rgb,
+            original_height,
+            original_width,
+        ) = pad_pair_to_multiple(
+            hsi=hsi,
+            rgb=rgb,
+            multiple=MODEL_DOWNSAMPLE_FACTOR,
+        )
+
+        rgb_batch = (
+            padded_rgb.unsqueeze(0)
+            .to(device, dtype=torch.float32)
+        )
+        coarse_prediction = model.coarse_estimate(
+            rgb_batch
+        ).float()
+
+        context = (
+            None
+            if model.bridge.condition_key == "nocond"
+            else coarse_prediction
+        )
+        bridge_prediction = model.bridge.sample(
+            y=coarse_prediction,
+            context=context,
+            clip_denoised=False,
+            sample_mid_step=False,
+        )
+        if not isinstance(bridge_prediction, torch.Tensor):
+            raise TypeError(
+                "Expected final Brownian bridge sample to be a tensor."
+            )
+        bridge_prediction = clamp_prediction(
+            bridge_prediction.float()
+        )
+
+        bridge_prediction = bridge_prediction[
+            0,
+            :,
+            :original_height,
+            :original_width,
+        ].cpu()
+        target = hsi[
+            :,
+            :original_height,
+            :original_width,
+        ].float().cpu()
+
+        image_metrics = calculate_single_image_metrics(
+            bridge_prediction.unsqueeze(0),
+            target.unsqueeze(0),
+        )
+
+        for key in metric_sums:
+            metric_sums[key] += image_metrics[key]
+        evaluated_images += 1
+
+        stem = Path(hsi_path_string).stem
+        print(
+            f"  [{evaluated_images:04d}/{len(dataset):04d}] {stem} | "
+            f"MRAE={image_metrics['mrae']:.6f} | "
+            f"RMSE={image_metrics['rmse']:.6f} | "
+            f"SAM={image_metrics['sam']:.4f} | "
+            f"PSNR={image_metrics['psnr']:.4f} | "
+            f"SSIM={image_metrics['ssim']:.6f}"
+        )
+
+    if evaluated_images == 0:
+        raise RuntimeError(
+            "No validation images were evaluated during full inference."
+        )
+
+    average_metrics = {
+        key: value / evaluated_images
+        for key, value in metric_sums.items()
+    }
+
+    print(
+        "\nFull validation-set inference summary "
+        f"({evaluated_images} images, complete reverse sampling):\n"
+        f"  Average MRAE: {average_metrics['mrae']:.6f}\n"
+        f"  Average RMSE: {average_metrics['rmse']:.6f}\n"
+        f"  Average SAM:  {average_metrics['sam']:.4f} deg\n"
+        f"  Average PSNR: {average_metrics['psnr']:.4f} dB\n"
+        f"  Average SSIM: {average_metrics['ssim']:.6f}"
+    )
+
+    return {
+        "evaluated_images": evaluated_images,
+        **average_metrics,
+    }
+
+
+# =============================================================================
 # Mode parser and main
 # =============================================================================
 
@@ -2387,6 +2543,11 @@ def main() -> None:
             device=device,
         )
         run_visualization(
+            model=model,
+            validation_pairs=validation_pairs,
+            device=device,
+        )
+        evaluate_full_validation_inference(
             model=model,
             validation_pairs=validation_pairs,
             device=device,
