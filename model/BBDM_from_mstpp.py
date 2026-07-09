@@ -475,7 +475,7 @@ class AttentionBlock(nn.Module):
         return (residual + h).reshape(batch, channels, *spatial)
 
 
-class ContextBlock(nn.Module):
+'''class ContextBlock(nn.Module):
     """
     Compact spatial context injection compatible with BBDM's `context=` API.
 
@@ -510,7 +510,45 @@ class ContextBlock(nn.Module):
             align_corners=False,
         )
         context = context.mean(dim=1, keepdim=True)
-        return x + self.gate * self.proj(context).to(dtype=x.dtype)
+        return x + self.gate * self.proj(context).to(dtype=x.dtype)'''
+
+class ContextBlock(nn.Module):
+    """
+    Inject the full MST++ prediction without collapsing the spectral dimension.
+    """
+
+    def __init__(self, channels: int, context_channels: int = 31):
+        super().__init__()
+
+        self.proj = nn.Sequential(
+            nn.Conv2d(context_channels, channels, kernel_size=1, bias=False),
+            ChannelLayerNorm(channels),
+            nn.SiLU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+        )
+
+        self.gate = nn.Parameter(torch.zeros(1, channels, 1, 1))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        context: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+
+        if context is None:
+            return x
+
+        context = F.interpolate(
+            context,
+            size=x.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        context = self.proj(context)
+
+        return x + self.gate * context
+
 
 
 class UNetModel(nn.Module):
