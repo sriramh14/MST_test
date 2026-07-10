@@ -52,9 +52,7 @@ from torch import Tensor
 #
 # Change only this import to match your project structure and class name.
 # Example:
-from .MST_Plus_Plus import MST_Plus_Plus
-
-
+from model.MST_Plus_Plus import MST_Plus_Plus
 
 
 # -------------------------------------------------------------------------
@@ -1134,13 +1132,43 @@ class FrozenMSTDualBridge(nn.Module):
         )
 
     def run_mst(self, rgb: Tensor) -> Tensor:
-        if self.freeze_mst:
-            with torch.no_grad():
-                output = self.mst_model(rgb)
-        else:
-            output = self.mst_model(rgb)
+        """
+        Run the frozen MST++ estimator strictly in float32.
 
-        mst_hsi = self._extract_mst_output(output)
+        The surrounding training step may use CUDA autocast for the trainable
+        bridge. `torch.no_grad()` does not disable autocast, so without this
+        local autocast-disabled region MST++ can still receive FP16/BF16
+        tensors. Some cuDNN convolution plans used by MST++ positional
+        embeddings are unsupported in mixed precision and raise:
+
+            RuntimeError: GET was unable to find an engine ...
+
+        The bridge resumes using the outer autocast context after this method
+        returns.
+        """
+        rgb_float = rgb.float()
+
+        if rgb_float.is_cuda:
+            amp_disabled = torch.autocast(
+                device_type="cuda",
+                enabled=False,
+            )
+        else:
+            # torch.autocast(..., enabled=False) is safe on CPU too and avoids
+            # adding another import solely for nullcontext.
+            amp_disabled = torch.autocast(
+                device_type="cpu",
+                enabled=False,
+            )
+
+        if self.freeze_mst:
+            with torch.no_grad(), amp_disabled:
+                output = self.mst_model(rgb_float)
+        else:
+            with amp_disabled:
+                output = self.mst_model(rgb_float)
+
+        mst_hsi = self._extract_mst_output(output).float()
 
         if mst_hsi.ndim != 4:
             raise ValueError(
@@ -1210,3 +1238,36 @@ def build_default_hsi_bridge(
     )
 
 
+# Example integrated construction after editing the MST++ import:
+#
+# bridge = build_default_hsi_bridge(spectral_channels=31)
+# model = FrozenMSTDualBridge(
+#     bridge=bridge,
+#     mst_checkpoint_path="path/to/mst_checkpoint.pth",
+#     mst_model_kwargs={},  # Add your MST++ constructor arguments here.
+#     strict_checkpoint_loading=True,
+# )
+#
+# During training:
+# outputs = model(rgb, ground_truth_hsi)
+# loss = outputs["loss"]
+
+
+if __name__ == "__main__":
+    # Bridge-only shape smoke test. It does not require the MST++ import.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    bridge = build_default_hsi_bridge(spectral_channels=31).to(device)
+    ground_truth = torch.randn(2, 31, 64, 64, device=device)
+    mst_prediction = torch.randn(2, 31, 64, 64, device=device)
+
+    training_output = bridge(ground_truth, mst_prediction)
+    print("Training loss:", float(training_output["loss"]))
+    print("x0 prediction:", tuple(training_output["x0_prediction"].shape))
+
+    bridge.eval()
+    reconstructed = bridge.sample(
+        mst_prediction,
+        deterministic_initialization=True,
+    )
+    print("Reconstructed:", tuple(reconstructed.shape))
