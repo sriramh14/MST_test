@@ -922,7 +922,7 @@ class FrozenMSTDualBridge(nn.Module):
 
     Edit the import near the top of this file:
 
-        from mst_architecture import MSTPlusPlus
+        from mst_architecture import MST_Plus_Plus
 
     so that it points to your MST++ architecture file and class.
 
@@ -944,17 +944,17 @@ class FrozenMSTDualBridge(nn.Module):
     ) -> None:
         super().__init__()
 
-        if MSTPlusPlus is None:
+        if MST_Plus_Plus is None:
             raise ImportError(
                 "The MST++ architecture could not be imported. Edit the "
-                "'from mst_architecture import MSTPlusPlus' line near the "
+                "'from mst_architecture import MST_Plus_Plus' line near the "
                 "top of this file to match your architecture module and "
                 "class name."
             ) from _MST_IMPORT_ERROR
 
         mst_model_kwargs = {} if mst_model_kwargs is None else mst_model_kwargs
 
-        self.mst_model = MSTPlusPlus(**mst_model_kwargs)
+        self.mst_model = MST_Plus_Plus(**mst_model_kwargs)
         self.bridge = bridge
         self.freeze_mst = freeze_mst
 
