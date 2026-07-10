@@ -14,13 +14,14 @@ into a single module and adapts it to the hyperspectral reconstruction setting:
       as the original RDBM already internally models the residual between
       x0 and mu (see Unet.forward: `return x + mu`, and the paper's
       pi = x0 - mu modulation term).
-    - All diffusion equations, the (Theta, Sigma) scheduler derived from
-      Doob's h-transform / OU bridge, the forward q_sample process, the
-      deterministic reverse (DDIM-style) sampling recursion, and the U-Net
-      architecture (ResNet blocks, linear/full attention, sinusoidal time
-      embeddings, conditioning-by-concatenation) are kept as close to the
-      original implementation as possible. Only the channel count (3 -> 31)
-      and the introduction of the frozen MST++ conditioning network are new.
+    - The paper's residual-modulated forward process is used explicitly:
+          x_t = mu + (x_0 - mu) * Theta_t
+                   + (x_0 - mu) * Sigma_t * epsilon.
+      Thus, regions or spectral values already reconstructed correctly by
+      MST++ receive little or no perturbation.
+    - This implementation uses the stable x_0-prediction parameterization:
+      the U-Net predicts the clean HSI as mu plus a learned residual. The
+      reverse recursion is the paper's residual form with pi_hat=x0_hat-mu.
 
 Usage:
     model = RDBMHSI(mst_ckpt="path/to/mstplusplus.pth")
@@ -438,9 +439,8 @@ class Unet(nn.Module):
         x = self.final_res_block(x, t)
         x = self.final_conv(x)
         x = x[..., :H, :W].contiguous()
-        # The network internally predicts the residual (x_start - mu) and
-        # adds mu back -> this is exactly the "residual-only" learning
-        # objective requested: the U-Net never has to reproduce mu itself.
+        # x is the learned clean residual pi_hat. Adding the fixed endpoint
+        # mu yields an x0 prediction: x0_hat = mu + pi_hat.
         return x + mu
 
 
@@ -450,6 +450,21 @@ class Unet(nn.Module):
 # =========================================================================
 
 class RDBM(nn.Module):
+    """Residual-modulated diffusion bridge with x0 prediction.
+
+    The paper's forward process is
+
+        x_t = mu + pi * Theta_t + pi * Sigma_t * epsilon,
+        pi  = x_0 - mu.
+
+    The denoiser predicts x_0 directly. Equivalently, because the U-Net adds
+    ``mu`` to its residual output, it predicts ``pi_hat = x0_hat - mu``.
+
+    Only ``pred_x_start`` is exposed. The previous ``pred_noise`` option was
+    inconsistent with the U-Net output and could divide by zero at the
+    terminal bridge endpoint, where Sigma_T = 0.
+    """
+
     def __init__(
         self,
         model,
@@ -460,11 +475,34 @@ class RDBM(nn.Module):
         timesteps=100,
         sampling_timesteps=10,
         condition=True,
+        lamb=10.0 / 255.0,
+        loss_type='l1',
     ):
         super().__init__()
 
-        assert objective in ['pred_noise', 'pred_x_start']
-        assert sampling_type in ['pred_noise', 'pred_x_start']
+        if objective != 'pred_x_start':
+            raise ValueError(
+                "This implementation supports only objective='pred_x_start'. "
+                "The U-Net outputs x0 = mu + predicted_residual."
+            )
+        if sampling_type != 'pred_x_start':
+            raise ValueError(
+                "This implementation supports only sampling_type='pred_x_start'."
+            )
+        if timesteps < 2:
+            raise ValueError('timesteps must be at least 2.')
+        if sampling_timesteps is None:
+            sampling_timesteps = timesteps
+        if not 1 <= sampling_timesteps <= timesteps:
+            raise ValueError(
+                'sampling_timesteps must be between 1 and timesteps, inclusive.'
+            )
+        if lamb <= 0:
+            raise ValueError('lamb must be positive.')
+        if loss_type not in {'l1', 'l2'}:
+            raise ValueError("loss_type must be either 'l1' or 'l2'.")
+        if not condition:
+            raise ValueError('RDBMHSI requires condition=True.')
 
         self.model = model
         self.channels = self.model.channels
@@ -472,11 +510,12 @@ class RDBM(nn.Module):
         self.condition = condition
         self.objective = objective
         self.sampling_type = sampling_type
-        self.num_timesteps = timesteps
-        self.sampling_timesteps = sampling_timesteps
+        self.num_timesteps = int(timesteps)
+        self.sampling_timesteps = int(sampling_timesteps)
+        self.lamb = float(lamb)
+        self.loss_type = loss_type
 
-        lamb = 1e-4
-        thetas = betas_for_alpha_bar(timesteps)
+        thetas = betas_for_alpha_bar(self.num_timesteps)
         thetas_cumsum_0_to_t = thetas.cumsum(dim=0)
         thetas_cumsum_0_to_T = thetas_cumsum_0_to_t[-1]
         thetas_cumsum_t_to_T = thetas_cumsum_0_to_T - thetas_cumsum_0_to_t
@@ -485,14 +524,18 @@ class RDBM(nn.Module):
         sinh_thetas_cumsum_0_to_T = torch.sinh(thetas_cumsum_0_to_T)
         sinh_thetas_cumsum_t_to_T = torch.sinh(thetas_cumsum_t_to_T)
 
-        Theta = sinh_thetas_cumsum_t_to_T / (sinh_thetas_cumsum_0_to_T)
-        Sigma2 = 2 * lamb * (sinh_thetas_cumsum_0_to_t) * (sinh_thetas_cumsum_t_to_T) / (sinh_thetas_cumsum_0_to_T)
-        Sigma = torch.sqrt(Sigma2)
+        Theta = sinh_thetas_cumsum_t_to_T / sinh_thetas_cumsum_0_to_T
+        Sigma2 = (
+            2
+            * self.lamb
+            * sinh_thetas_cumsum_0_to_t
+            * sinh_thetas_cumsum_t_to_T
+            / sinh_thetas_cumsum_0_to_T
+        )
+        # Numerical guard only; the analytical quantity is non-negative.
+        Sigma = torch.sqrt(Sigma2.clamp_min(0.0))
 
-        self.sampling_timesteps = default(sampling_timesteps, timesteps)
-
-        assert self.sampling_timesteps <= timesteps
-        self.is_ddim_sampling = self.sampling_timesteps < timesteps
+        self.is_ddim_sampling = self.sampling_timesteps < self.num_timesteps
 
         def register_buffer(name, val):
             return self.register_buffer(name, val.to(torch.float32))
@@ -508,161 +551,166 @@ class RDBM(nn.Module):
         register_buffer('Sigma2', Sigma2)
         register_buffer('Sigma', Sigma)
 
-    def predict_x_start_from_noise(self, x_t, t, mu, noise):
-        return (
-            ((x_t - mu - (extract(self.Sigma, t, x_t.shape) * noise)) / (extract(self.Theta, t, x_t.shape))) + mu
-        )
-
-    def predict_noise_from_x_start(self, x_t, t, mu, x_start):
-        return (
-            (x_t - mu - extract(self.Theta, t, x_t.shape) * (x_start - mu)) / extract(self.Sigma, t, x_t.shape)
-        )
-
     def model_predictions(self, x_t, mu, t, clip_denoised=False):
-        # NOTE: clip_denoised defaults to False here because HSI reflectance
-        # values are not necessarily bounded to [-1, 1] like RGB pixels.
-        # Set clip_denoised=True if your HSI data is normalized accordingly.
-        model_output = self.model(x_t, mu, t)
+        """Predict x0 without deriving a noise estimate at Sigma_T=0."""
+        x_start = self.model(x_t, mu, t)
 
-        maybe_clip = partial(torch.clamp, min=-1., max=1.) if clip_denoised else identity
+        if clip_denoised:
+            x_start = x_start.clamp(-1.0, 1.0)
 
-        if self.objective == "pred_noise":
-            noise = model_output
-            x_start = self.predict_x_start_from_noise(x_t, t, mu, noise)
-            x_start = maybe_clip(x_start)
-        elif self.objective == "pred_x_start":
-            x_start = model_output
-            x_start = maybe_clip(x_start)
-            noise = self.predict_noise_from_x_start(x_t, t, mu, x_start)
-        else:
-            exit('please specify the prediction mode')
-
-        return ModelResPrediction(noise, x_start)
+        return ModelResPrediction(pred_noise=None, pred_x_start=x_start)
 
     @torch.no_grad()
-    def ddim_sample(self, x_input, gt, shape, last=True):
-        mu = x_input[0]
-        batch, device, total_timesteps, sampling_timesteps, objective = shape[
-            0], self.thetas.device, self.num_timesteps, self.sampling_timesteps, self.objective
+    def ddim_sample(self, mu, shape, last=True):
+        """Deterministic reverse recursion from the endpoint ``mu`` to x0."""
+        if tuple(mu.shape) != tuple(shape):
+            raise ValueError(
+                f'mu shape {tuple(mu.shape)} does not match requested shape {tuple(shape)}.'
+            )
 
-        times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)
+        batch = shape[0]
+        device = mu.device
+        total_timesteps = self.num_timesteps
+        sampling_timesteps = self.sampling_timesteps
 
-        times = list(reversed(times.int().tolist()))
+        times = torch.linspace(
+            -1,
+            total_timesteps - 1,
+            steps=sampling_timesteps + 1,
+            device=device,
+        )
+        times = list(reversed(times.long().tolist()))
         time_pairs = list(zip(times[:-1], times[1:]))
 
-        if self.condition:
-            img = mu
-        else:
-            img = torch.randn(shape, device=device)
+        # A diffusion bridge has the deterministic terminal endpoint x_T=mu.
+        img = mu
+        trajectory = [] if not last else None
 
-        x_start = None
-
-        if not last:
-            img_list = []
-
-        for time, time_next in tqdm(time_pairs, desc='sampling loop time step', disable=True):
-            time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
-            preds = self.model_predictions(img, mu, time_cond)
-
-            noise = preds.pred_noise
-            x_start = preds.pred_x_start
+        for time, time_next in tqdm(
+            time_pairs,
+            desc='sampling loop time step',
+            disable=True,
+        ):
+            time_cond = torch.full(
+                (batch,), time, device=device, dtype=torch.long
+            )
+            x_start = self.model_predictions(
+                img, mu, time_cond
+            ).pred_x_start
 
             if time_next < 0:
                 img = x_start
-                if not last:
-                    img_list.append(img)
+                if trajectory is not None:
+                    trajectory.append(img)
                 continue
 
-            Theta_now = self.Theta[time]
-            Theta_next = self.Theta[time_next]
-            Sigma_now = self.Sigma[time]
-            Sigma_next = self.Sigma[time_next]
+            theta_now = self.Theta[time]
+            theta_next = self.Theta[time_next]
+            sigma_now = self.Sigma[time]
+            sigma_next = self.Sigma[time_next]
 
-            if self.sampling_type == "pred_noise":
-                if time == (self.num_timesteps - 1):
-                    img = mu
-                else:
-                    img = mu + (Theta_next / Theta_now) * (img - mu) - (
-                        ((Theta_next / Theta_now) * Sigma_now) - Sigma_next) * noise
-            elif self.sampling_type == "pred_x_start":
-                if time == (self.num_timesteps - 1):
-                    img = mu + Theta_next * (x_start - mu)
-                else:
-                    img = mu + (Sigma_next / Sigma_now) * (img - mu) + (
-                        Theta_next - (Theta_now * Sigma_next / Sigma_now)) * (x_start - mu)
+            if time == total_timesteps - 1:
+                # At T, Sigma_T=Theta_T=0 and img=mu. Use the analytical
+                # endpoint limit instead of forming a 0/0 ratio.
+                img = mu + theta_next * (x_start - mu)
             else:
-                exit('Illegal objective')
+                sigma_ratio = sigma_next / sigma_now
+                img = (
+                    mu
+                    + sigma_ratio * (img - mu)
+                    + (theta_next - theta_now * sigma_ratio)
+                    * (x_start - mu)
+                )
 
-            if not last:
-                img_list.append(img)
+            if trajectory is not None:
+                trajectory.append(img)
 
-        if self.condition:
-            if not last:
-                img_list = [mu] + img_list
-            else:
-                img_list = [mu, img]
-            return img_list
-        else:
-            if not last:
-                img_list = img_list
-            else:
-                img_list = [img]
-            return img_list
+        if last:
+            return [mu, img]
+        return [mu, *trajectory]
 
     def sample(self, x_input=None, gt=None, batch_size=16, last=True):
-        image_size, channels = self.image_size, self.channels
-        sample_fn = self.ddim_sample
-        if self.condition:
-            x_input = x_input.unsqueeze(0)
-            batch_size, channels, h, w = x_input[0].shape
-            size = (batch_size, channels, h, w)
-        else:
-            size = (batch_size, channels, image_size, image_size)
+        del gt, batch_size  # retained in the signature for backward compatibility
 
-        samples = sample_fn(x_input, gt, size, last=last)
-        return samples
+        if x_input is None:
+            raise ValueError('x_input (the MST++ prediction mu) is required.')
+        if x_input.ndim != 4:
+            raise ValueError(
+                f'x_input must have shape [B,C,H,W], got {tuple(x_input.shape)}.'
+            )
+        if x_input.shape[1] != self.channels:
+            raise ValueError(
+                f'Expected {self.channels} HSI channels, got {x_input.shape[1]}.'
+            )
+
+        return self.ddim_sample(x_input, tuple(x_input.shape), last=last)
 
     def q_sample(self, x_start, mu, t, noise=None):
-        noise = default(noise, lambda: torch.randn_like(x_start))
-        return (
-            mu + (x_start - mu) * extract(self.Theta, t, x_start.shape) + extract(self.Sigma, t, x_start.shape) * noise
-        )
+        """Sample the paper's residual-modulated forward bridge q(x_t|x0,mu)."""
+        if x_start.shape != mu.shape:
+            raise ValueError(
+                f'x_start shape {tuple(x_start.shape)} and mu shape '
+                f'{tuple(mu.shape)} must match.'
+            )
 
-    @property
-    def loss_fn(self, loss_type='l1'):
-        if loss_type == 'l1':
-            return F.l1_loss
-        elif loss_type == 'l2':
-            return F.mse_loss
-        else:
-            raise ValueError(f'invalid loss type {loss_type}')
+        noise = default(noise, lambda: torch.randn_like(x_start))
+        if noise.shape != x_start.shape:
+            raise ValueError(
+                f'noise shape {tuple(noise.shape)} must match x_start '
+                f'shape {tuple(x_start.shape)}.'
+            )
+
+        residual = x_start - mu
+        theta_t = extract(self.Theta, t, x_start.shape)
+        sigma_t = extract(self.Sigma, t, x_start.shape)
+
+        # Crucial RDBM term: residual also modulates the noise amplitude.
+        return mu + residual * theta_t + residual * sigma_t * noise
+
+    def _loss(self, prediction, target):
+        if self.loss_type == 'l1':
+            return F.l1_loss(prediction, target)
+        return F.mse_loss(prediction, target)
 
     def p_losses(self, imgs, t, noise=None):
-        # imgs = [x_start (gt HSI), mu (frozen MST++ prediction)]
-        if isinstance(imgs, list):
-            x_start = imgs[0]
-            mu = imgs[1]
-        else:
-            raise ValueError('imgs must be a list [gt_hsi, mu]')
+        # imgs = [x_start (GT HSI), mu (frozen MST++ prediction)]
+        if not isinstance(imgs, (list, tuple)) or len(imgs) != 2:
+            raise ValueError('imgs must be [gt_hsi, mu].')
+
+        x_start, mu = imgs
+        if x_start.shape != mu.shape:
+            raise ValueError(
+                f'GT HSI shape {tuple(x_start.shape)} does not match MST++ '
+                f'prediction shape {tuple(mu.shape)}.'
+            )
 
         noise = default(noise, lambda: torch.randn_like(x_start))
+        x_t = self.q_sample(x_start, mu, t, noise=noise)
 
-        x = self.q_sample(x_start, mu, t, noise=noise)
-        model_out = self.model(x, mu, t)
-        target = x_start
-
-        loss = F.l1_loss(model_out, target)
-        return loss
+        # x0-prediction parameterization. Since Unet.forward returns
+        # mu + predicted_residual, this is equivalent to supervising the
+        # predicted clean residual against x_start - mu.
+        x_start_pred = self.model(x_t, mu, t)
+        return self._loss(x_start_pred, x_start)
 
     def forward(self, img, *args, **kwargs):
-        if isinstance(img, list):
-            b, c, h, w, device = *img[0].shape, img[0].device
-        else:
-            b, c, h, w, device = *img.shape, img.device
+        if not isinstance(img, (list, tuple)) or len(img) != 2:
+            raise ValueError('img must be [gt_hsi, mu].')
 
-        t = torch.randint(0, int(self.num_timesteps), (b,), device=device).long()
-        t = torch.clamp(t, min=0, max=self.num_timesteps - 1)
+        x_start = img[0]
+        if x_start.ndim != 4:
+            raise ValueError(
+                f'gt_hsi must have shape [B,C,H,W], got {tuple(x_start.shape)}.'
+            )
 
+        batch = x_start.shape[0]
+        t = torch.randint(
+            0,
+            self.num_timesteps,
+            (batch,),
+            device=x_start.device,
+            dtype=torch.long,
+        )
         return self.p_losses(img, t, *args, **kwargs)
 
 
@@ -703,7 +751,11 @@ class RDBMHSI(nn.Module):
         image_size=256,
         objective='pred_x_start',
         sampling_type='pred_x_start',
+        lamb=10.0 / 255.0,
+        loss_type='l1',
         mst_kwargs=None,
+        mst_strict=True,
+        check_finite=False,
     ):
         super().__init__()
 
@@ -711,9 +763,12 @@ class RDBMHSI(nn.Module):
         mst_kwargs = default(mst_kwargs, {})
         self.mst = MST_Plus_Plus(**mst_kwargs)
         if mst_ckpt is not None:
-            state_dict = torch.load(mst_ckpt, map_location='cpu')
-            state_dict = state_dict.get('state_dict', state_dict)
-            self.mst.load_state_dict(state_dict, strict=True)
+            checkpoint = torch.load(mst_ckpt, map_location='cpu')
+            state_dict = self._extract_mst_state_dict(checkpoint)
+            self.mst.load_state_dict(state_dict, strict=mst_strict)
+
+        self.check_finite = bool(check_finite)
+        self.hsi_channels = int(hsi_channels)
 
         self.mst.eval()
         for p in self.mst.parameters():
@@ -734,12 +789,68 @@ class RDBMHSI(nn.Module):
             timesteps=timesteps,
             sampling_timesteps=sampling_timesteps,
             condition=True,
+            lamb=lamb,
+            loss_type=loss_type,
         )
 
+    @staticmethod
+    def _extract_mst_state_dict(checkpoint):
+        """Extract a state dict from common MST++ checkpoint layouts."""
+        if not isinstance(checkpoint, dict):
+            raise TypeError(
+                'MST++ checkpoint must be a state-dict-like dictionary.'
+            )
+
+        state_dict = checkpoint
+        for key in ('state_dict', 'model_state_dict', 'model', 'mst', 'mst_state_dict'):
+            value = checkpoint.get(key)
+            if isinstance(value, dict):
+                state_dict = value
+                break
+
+        cleaned = {}
+        for key, value in state_dict.items():
+            if not torch.is_tensor(value):
+                continue
+            while key.startswith('module.'):
+                key = key[len('module.'):]
+            if key.startswith('mst.'):
+                key = key[len('mst.'):]
+            cleaned[key] = value
+
+        if not cleaned:
+            raise ValueError('No tensor parameters were found in the MST++ checkpoint.')
+        return cleaned
+
+    def train(self, mode=True):
+        """Keep the frozen MST++ conditioner in evaluation mode."""
+        super().train(mode)
+        self.mst.eval()
+        return self
+
     def _frozen_mst_predict(self, rgb):
+        if rgb.ndim != 4:
+            raise ValueError(
+                f'rgb must have shape [B,3,H,W], got {tuple(rgb.shape)}.'
+            )
+
         self.mst.eval()
         with torch.no_grad():
             mu = self.mst(rgb)
+
+        if not torch.is_tensor(mu):
+            raise TypeError('MST++ must return a tensor.')
+        if mu.ndim != 4:
+            raise ValueError(
+                f'MST++ output must have shape [B,C,H,W], got {tuple(mu.shape)}.'
+            )
+        if mu.shape[1] != self.hsi_channels:
+            raise ValueError(
+                f'MST++ returned {mu.shape[1]} channels; expected '
+                f'{self.hsi_channels}.'
+            )
+        if self.check_finite and not torch.isfinite(mu).all():
+            raise FloatingPointError('MST++ output contains NaN or Inf values.')
         return mu
 
     def forward(self, rgb, gt_hsi):
@@ -748,9 +859,26 @@ class RDBMHSI(nn.Module):
         predicted and ground-truth HSI, with mu fixed to the frozen MST++
         output.
         """
+        if gt_hsi.ndim != 4:
+            raise ValueError(
+                f'gt_hsi must have shape [B,C,H,W], got {tuple(gt_hsi.shape)}.'
+            )
+        if gt_hsi.shape[1] != self.hsi_channels:
+            raise ValueError(
+                f'gt_hsi has {gt_hsi.shape[1]} channels; expected '
+                f'{self.hsi_channels}.'
+            )
+        if self.check_finite and not torch.isfinite(gt_hsi).all():
+            raise FloatingPointError('Ground-truth HSI contains NaN or Inf values.')
+
         mu = self._frozen_mst_predict(rgb)
-        loss = self.rdbm([gt_hsi, mu])
-        return loss
+        if mu.shape != gt_hsi.shape:
+            raise ValueError(
+                f'MST++ output shape {tuple(mu.shape)} does not match GT HSI '
+                f'shape {tuple(gt_hsi.shape)}.'
+            )
+
+        return self.rdbm([gt_hsi, mu])
 
     @torch.no_grad()
     def reconstruct(self, rgb, last=True):
@@ -761,9 +889,9 @@ class RDBMHSI(nn.Module):
         """
         mu = self._frozen_mst_predict(rgb)
         samples = self.rdbm.sample(x_input=mu, last=last)
-        # samples = [mu, x0_pred] (or full trajectory if last=False);
-        # the final reconstructed HSI is the last element.
-        hsi_pred = samples[-1]
-        return hsi_pred
 
-
+        # Preserve the convenient tensor return for normal inference, while
+        # returning the complete trajectory when explicitly requested.
+        if last:
+            return samples[-1]
+        return samples
