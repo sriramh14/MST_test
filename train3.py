@@ -128,9 +128,9 @@ MAX_VARIANCE = 1.0
 SAMPLING_ETA = 0.0
 SKIP_SAMPLE = True
 SAMPLE_TYPE = "linear"
-SAMPLE_STEPS = 100
+SAMPLE_STEPS = 5
 LOSS_TYPE = "l1"
-OBJECTIVE = "grad"
+OBJECTIVE = "ysubx"
 
 # BBDM UNet settings.
 TRAIN_CROP_SIZE = 256
@@ -149,7 +149,7 @@ UNET_RESBLOCK_UPDOWN = False
 # "nocond" keeps the UNet unconditioned while y still remains the Brownian
 # bridge endpoint in every q/p equation. Change this only when you explicitly
 # want the coarse cube additionally injected through the UNet context path.
-CONDITION_KEY = "cond"
+CONDITION_KEY = "concat"
 
 MODEL_DOWNSAMPLE_FACTOR = 2 ** (len(UNET_CHANNEL_MULT) - 1)
 
