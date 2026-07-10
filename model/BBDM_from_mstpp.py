@@ -527,7 +527,8 @@ class ContextBlock(nn.Module):
             nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
         )
 
-        self.gate = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        #self.gate = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        self.gate = nn.Parameter(torch.ones(1, channels, 1, 1) * 0.1)
 
     def forward(
         self,
