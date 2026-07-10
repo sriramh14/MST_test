@@ -835,11 +835,24 @@ class RDBMHSI(nn.Module):
             )
 
         self.mst.eval()
-        with torch.no_grad():
-            mu = self.mst(rgb)
+        rgb_float = rgb.float()
+
+        # The conditioner is frozen. Keep it in float32 even when the caller
+        # wraps the overall training step in CUDA AMP. This avoids unsupported
+        # FP16/BF16 cuDNN convolution plans in some MST++ layers while leaving
+        # AMP enabled for the trainable RDBM U-Net.
+        if rgb.device.type == 'cuda':
+            with torch.no_grad(), torch.autocast(
+                device_type='cuda', enabled=False
+            ):
+                mu = self.mst(rgb_float)
+        else:
+            with torch.no_grad():
+                mu = self.mst(rgb_float)
 
         if not torch.is_tensor(mu):
             raise TypeError('MST++ must return a tensor.')
+        mu = mu.float()
         if mu.ndim != 4:
             raise ValueError(
                 f'MST++ output must have shape [B,C,H,W], got {tuple(mu.shape)}.'
