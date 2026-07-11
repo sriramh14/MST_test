@@ -131,11 +131,17 @@ VALIDATION_PAIR_VALIDATION_CACHE = OUTPUT_DIR / "validation_pair_validation_cach
 
 # Residual Diffusion Bridge settings.
 NUM_TIMESTEPS = 100
-SAMPLE_STEPS = 20
+SAMPLE_STEPS = 10
 RDBM_LAMBDA = 10.0 / 255.0
 LOSS_TYPE = "l1"
 OBJECTIVE = "pred_x_start"
 SAMPLING_TYPE = "pred_x_start"
+
+# Added RGB and spectral conditioning settings.
+RGB_ADAPTER_DIM = 32
+USE_RGB_CONDITION = True
+USE_SPECTRAL_MODELING = True
+SPECTRAL_GRADIENT_WEIGHT = 0.05
 
 # RDBM U-Net settings. The corrected model file exposes the base width and
 # channel multipliers directly; the remaining U-Net details live in that file.
@@ -153,7 +159,7 @@ USE_AUGMENTATION = True
 # Training settings.
 BATCH_SIZE = 2
 VALIDATION_BATCH_SIZE = 2
-NUM_EPOCHS = 40
+NUM_EPOCHS = 10
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 MIN_LEARNING_RATE = 1e-7
@@ -1244,6 +1250,10 @@ def build_model(device: torch.device) -> RDBMHSI:
         sampling_type=SAMPLING_TYPE,
         lamb=RDBM_LAMBDA,
         loss_type=LOSS_TYPE,
+        spectral_gradient_weight=SPECTRAL_GRADIENT_WEIGHT,
+        rgb_adapter_dim=RGB_ADAPTER_DIM,
+        use_rgb_condition=USE_RGB_CONDITION,
+        use_spectral_modeling=USE_SPECTRAL_MODELING,
         mst_kwargs=build_mst_kwargs(),
         mst_strict=STRICT_MST_CHECKPOINT,
         check_finite=True,
@@ -1296,6 +1306,10 @@ def model_config_dictionary() -> dict:
         "loss_type": LOSS_TYPE,
         "objective": OBJECTIVE,
         "sampling_type": SAMPLING_TYPE,
+        "rgb_adapter_dim": RGB_ADAPTER_DIM,
+        "use_rgb_condition": USE_RGB_CONDITION,
+        "use_spectral_modeling": USE_SPECTRAL_MODELING,
+        "spectral_gradient_weight": SPECTRAL_GRADIENT_WEIGHT,
         "unet_model_channels": UNET_MODEL_CHANNELS,
         "unet_channel_mult": UNET_CHANNEL_MULT,
         "mst_checkpoint": MST_CHECKPOINT,
@@ -1380,8 +1394,24 @@ def clamp_prediction(prediction: torch.Tensor) -> torch.Tensor:
 
 
 def coarse_estimate(model: RDBMHSI, rgb: torch.Tensor) -> torch.Tensor:
-    """Return the frozen MST++ endpoint mu."""
-    return model._frozen_mst_predict(rgb)
+    """Return the frozen MST++ endpoint mu in full float32 precision.
+
+    This function can be called from inside the outer AMP autocast region used
+    for the trainable RDBM U-Net.  MST++ is frozen, so there is no benefit in
+    running it in FP16/BF16, and some cuDNN builds cannot select a convolution
+    engine for its positional-embedding convolutions in reduced precision.
+    The nested autocast-disabled region keeps only MST++ in float32; autocast
+    automatically resumes for the trainable U-Net after this function returns.
+    """
+    rgb_float = rgb.float()
+
+    if rgb.device.type == "cuda":
+        with torch.autocast(device_type="cuda", enabled=False):
+            mu = model._frozen_mst_predict(rgb_float)
+    else:
+        mu = model._frozen_mst_predict(rgb_float)
+
+    return mu.float()
 
 
 def one_step_rdbm_forward(
@@ -1422,16 +1452,11 @@ def one_step_rdbm_forward(
         t=timesteps,
         noise=noise,
     )
-    predicted_x0 = model.unet(true_xt, mu, timesteps)
+    predicted_x0 = model.unet(true_xt, mu, timesteps, rgb=rgb)
 
-    if model.rdbm.loss_type == "l1":
-        loss = F.l1_loss(predicted_x0, hsi)
-    elif model.rdbm.loss_type == "l2":
-        loss = F.mse_loss(predicted_x0, hsi)
-    else:
-        raise NotImplementedError(
-            f"Unsupported RDBM loss type: {model.rdbm.loss_type}"
-        )
+    # Use the model's configured reconstruction objective, including the
+    # optional adjacent-band spectral-gradient regularizer.
+    loss = model.rdbm._loss(predicted_x0, hsi)
 
     theta_t = extract(model.rdbm.Theta, timesteps, hsi.shape)
     sigma_t = extract(model.rdbm.Sigma, timesteps, hsi.shape)
@@ -1811,6 +1836,9 @@ def run_training(
         f"RDBM timesteps: {NUM_TIMESTEPS}\n"
         f"Reverse sampling steps: {SAMPLE_STEPS}\n"
         f"Residual-noise lambda: {RDBM_LAMBDA:.8f}"
+        f"RGB conditioning: {USE_RGB_CONDITION} (adapter={RGB_ADAPTER_DIM})\n"
+        f"Spectral modeling: {USE_SPECTRAL_MODELING} | "
+        f"spectral-gradient weight={SPECTRAL_GRADIENT_WEIGHT:.4f}"
     )
 
     for epoch in range(start_epoch, NUM_EPOCHS + 1):
