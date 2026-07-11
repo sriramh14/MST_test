@@ -25,8 +25,8 @@ The frozen imported MST++ produces the coarse HSI endpoint y. The bridge uses:
 
 Training minimizes the weighted sum of the forward bridge objective and reverse
 noise objective. Validation uses the same randomly sampled one-step bridge
-state. Visualization and full validation inference compute MRAE, RMSE, SAM,
-PSNR, and SSIM through imported loss modules after complete sampling.
+state. Visualization and full validation inference retain MRAE, RMSE, SAM,
+PSNR, and SSIM exactly as in the supplied script.
 """
 
 from __future__ import annotations
@@ -56,17 +56,6 @@ from model.dual_bridge_bbdm import (
     DualApproximatorHSIBridge,
     FrozenMSTDualBridge,
 )
-
-# -----------------------------------------------------------------------------
-# Change this path and the class names to match your existing loss file.
-# These modules are used for complete-sampling visualization metrics and for
-# full-resolution evaluation over the entire validation set.
-# -----------------------------------------------------------------------------
-from loss.mrae import mrae
-from loss.psnr import psnr
-from loss.rmse import rmse
-from loss.sam import sam
-from loss.ssim import ssim
 
 
 # =============================================================================
@@ -141,7 +130,7 @@ MAX_VARIANCE = 1.0
 SAMPLING_ETA = 0.0
 SKIP_SAMPLE = True
 SAMPLE_TYPE = "linear"
-SAMPLE_STEPS = 20
+SAMPLE_STEPS = 5
 LOSS_TYPE = "l1"
 OBJECTIVE = "grad"
 
@@ -181,7 +170,7 @@ USE_AUGMENTATION = True
 # Training settings.
 BATCH_SIZE = 2
 VALIDATION_BATCH_SIZE = 2
-NUM_EPOCHS = 30
+NUM_EPOCHS = 40
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 MIN_LEARNING_RATE = 1e-7
@@ -206,18 +195,6 @@ MRAE_EPSILON = 1e-6
 SAM_EPSILON = 1e-8
 SSIM_WINDOW_SIZE = 11
 SSIM_SIGMA = 1.5
-
-# Imported evaluation-loss output conventions.
-# Adjust these only if your corresponding module returns a different form.
-SAM_LOSS_RETURNS_RADIANS = True
-PSNR_LOSS_RETURNS_NEGATIVE_PSNR = False
-SSIM_LOSS_RETURNS_ONE_MINUS_SSIM = False
-
-# Saved after complete reverse sampling over the full validation set at the
-# end of training.
-FINAL_VALIDATION_METRICS_FILE = (
-    OUTPUT_DIR / "final_full_validation_metrics.pth"
-)
 
 # Checkpoint selection. Lower validation MRAE is considered better.
 BEST_METRIC_NAME = "loss"  # one-step x_t MRAE during validation
@@ -1097,166 +1074,7 @@ def make_loader(
 
 
 # =============================================================================
-# Imported evaluation loss modules
-# =============================================================================
-
-_EVALUATION_LOSS_MODULE_CACHE: Dict[str, Dict[str, Any]] = {}
-
-
-def get_evaluation_loss_modules(
-    device: torch.device,
-) -> Dict[str, Any]:
-    """
-    Construct the imported MRAE/RMSE/SAM/PSNR/SSIM modules once per device.
-
-    The constructors below intentionally use no arguments because the user will
-    adjust the imported names and constructor arguments to match the existing
-    loss file.
-    """
-    cache_key = str(device)
-    cached = _EVALUATION_LOSS_MODULE_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    modules: Dict[str, Any] = {
-        "mrae": mrae(),
-        "rmse": rmse(),
-        "sam": sam(),
-        "psnr": psnr(),
-        "ssim": ssim(),
-    }
-
-    for module in modules.values():
-        if isinstance(module, nn.Module):
-            module.to(device)
-            module.eval()
-
-    _EVALUATION_LOSS_MODULE_CACHE[cache_key] = modules
-    return modules
-
-
-def _extract_imported_loss_value(
-    result: Any,
-    metric_name: str,
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    Convert a loss-module result to one scalar tensor.
-
-    This accepts a scalar tensor directly and also tolerates common wrappers
-    such as dictionaries or tuples. Adjust this helper only if the local loss
-    modules return a different structure.
-    """
-    if isinstance(result, dict):
-        selected = None
-        for key in (
-            metric_name,
-            metric_name.upper(),
-            "loss",
-            "value",
-            "metric",
-        ):
-            if key in result:
-                selected = result[key]
-                break
-        if selected is None:
-            raise KeyError(
-                f"The imported {metric_name} module returned a dictionary "
-                f"without a recognized scalar key: {tuple(result.keys())}"
-            )
-        result = selected
-
-    if isinstance(result, (tuple, list)):
-        if not result:
-            raise ValueError(
-                f"The imported {metric_name} module returned an empty sequence."
-            )
-        result = result[0]
-
-    if torch.is_tensor(result):
-        value = result.to(device=device, dtype=torch.float32)
-    else:
-        value = torch.as_tensor(
-            result,
-            device=device,
-            dtype=torch.float32,
-        )
-
-    if value.numel() == 0:
-        raise ValueError(
-            f"The imported {metric_name} module returned an empty tensor."
-        )
-    return value.mean()
-
-
-def compute_imported_evaluation_metrics(
-    prediction: torch.Tensor,
-    target: torch.Tensor,
-) -> Dict[str, float]:
-    """
-    Compute all five metrics with the imported loss modules.
-
-    The prediction supplied here is always the completed Brownian-bridge
-    sample in visualization/full-validation evaluation, rather than a
-    one-step bridge estimate.
-    """
-    modules = get_evaluation_loss_modules(prediction.device)
-
-    mrae_value = _extract_imported_loss_value(
-        modules["mrae"](prediction, target),
-        "mrae",
-        prediction.device,
-    )
-    rmse_value = _extract_imported_loss_value(
-        modules["rmse"](prediction, target),
-        "rmse",
-        prediction.device,
-    )
-    sam_value = _extract_imported_loss_value(
-        modules["sam"](prediction, target),
-        "sam",
-        prediction.device,
-    )
-    psnr_value = _extract_imported_loss_value(
-        modules["psnr"](prediction, target),
-        "psnr",
-        prediction.device,
-    )
-    ssim_value = _extract_imported_loss_value(
-        modules["ssim"](prediction, target),
-        "ssim",
-        prediction.device,
-    )
-
-    if SAM_LOSS_RETURNS_RADIANS:
-        sam_value = torch.rad2deg(sam_value)
-
-    if PSNR_LOSS_RETURNS_NEGATIVE_PSNR:
-        psnr_value = -psnr_value
-
-    if SSIM_LOSS_RETURNS_ONE_MINUS_SSIM:
-        ssim_value = 1.0 - ssim_value
-
-    metrics = {
-        "mrae": float(mrae_value.item()),
-        "rmse": float(rmse_value.item()),
-        "sam": float(sam_value.item()),
-        "psnr": float(psnr_value.item()),
-        "ssim": float(ssim_value.item()),
-    }
-
-    for name, value in metrics.items():
-        if not math.isfinite(value):
-            raise FloatingPointError(
-                f"Imported {name.upper()} module returned a non-finite "
-                f"value: {value}"
-            )
-
-    return metrics
-
-
-# =============================================================================
-# Metric implementations retained from the supplied script
+# Metric implementations
 # =============================================================================
 
 def _resolve_data_range(target: torch.Tensor) -> torch.Tensor:
@@ -1391,13 +1209,7 @@ def calculate_single_image_metrics(
     prediction: torch.Tensor,
     target: torch.Tensor,
 ) -> Dict[str, float]:
-    """
-    Calculate MRAE, RMSE, SAM, PSNR, and SSIM with imported loss modules.
-
-    Both visualization and full validation call this function only after the
-    complete reverse Brownian Bridge sampling process has produced the final
-    refined HSI.
-    """
+    """Calculate all requested metrics for one BCHW image."""
     prediction = prediction.detach().float()
     target = target.detach().float()
 
@@ -1419,10 +1231,69 @@ def calculate_single_image_metrics(
             "Validation target contains NaN or Inf."
         )
 
-    return compute_imported_evaluation_metrics(
-        prediction=prediction,
-        target=target,
+    difference = prediction - target
+
+    mrae_value = torch.mean(
+        torch.abs(difference)
+        / (torch.abs(target) + MRAE_EPSILON)
     )
+    rmse_value = torch.sqrt(
+        torch.mean(difference.square()).clamp_min(0.0)
+    )
+
+    data_range = _resolve_data_range(target)
+    mse = torch.mean(difference.square())
+    psnr_value = (
+        20.0 * torch.log10(data_range.clamp_min(1e-12))
+        - 10.0 * torch.log10(mse.clamp_min(1e-12))
+    )
+
+    # SAM is computed at every spatial pixel along the spectral dimension.
+    prediction_vectors = prediction.permute(0, 2, 3, 1)
+    target_vectors = target.permute(0, 2, 3, 1)
+    dot_product = torch.sum(
+        prediction_vectors * target_vectors,
+        dim=-1,
+    )
+    prediction_norm = torch.linalg.vector_norm(
+        prediction_vectors,
+        dim=-1,
+    )
+    target_norm = torch.linalg.vector_norm(
+        target_vectors,
+        dim=-1,
+    )
+    norm_product = prediction_norm * target_norm
+    valid_pixels = norm_product > SAM_EPSILON
+
+    if valid_pixels.any():
+        cosine = (
+            dot_product[valid_pixels]
+            / norm_product[valid_pixels].clamp_min(SAM_EPSILON)
+        ).clamp(-1.0, 1.0)
+        sam_value = torch.rad2deg(torch.acos(cosine)).mean()
+    else:
+        sam_value = torch.zeros(
+            (),
+            device=prediction.device,
+            dtype=prediction.dtype,
+        )
+
+    ssim_value = spectral_ssim(prediction, target)
+
+    metrics = {
+        "mrae": float(mrae_value.item()),
+        "rmse": float(rmse_value.item()),
+        "sam": float(sam_value.item()),
+        "psnr": float(psnr_value.item()),
+        "ssim": float(ssim_value.item()),
+    }
+    for name, value in metrics.items():
+        if not math.isfinite(value):
+            raise FloatingPointError(
+                f"{name.upper()} returned a non-finite value: {value}"
+            )
+    return metrics
 
 
 @torch.no_grad()
@@ -2162,49 +2033,6 @@ def run_training(
                 f"{BEST_METRIC_NAME.upper()}={best_metric:.6f}"
             )
 
-    # Complete-sampling evaluation is intentionally performed after all
-    # epochs. The imported MRAE/RMSE/SAM/PSNR/SSIM modules are evaluated over
-    # every full-resolution validation image using the best bridge checkpoint.
-    final_checkpoint = (
-        BEST_CHECKPOINT
-        if BEST_CHECKPOINT.exists()
-        else LAST_CHECKPOINT
-    )
-    print(
-        "\nTraining complete. Running full validation-set evaluation with "
-        f"the checkpoint: {final_checkpoint}"
-    )
-
-    # Release the training copy before constructing the evaluation model.
-    del model
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    final_model = load_model_for_visualization(
-        checkpoint_path=final_checkpoint,
-        device=device,
-    )
-    final_validation_metrics = evaluate_full_validation_inference(
-        model=final_model,
-        validation_pairs=validation_pairs,
-        device=device,
-    )
-
-    torch.save(
-        {
-            "checkpoint": str(final_checkpoint),
-            "metrics": final_validation_metrics,
-            "metric_modules": (
-                "mrae, rmse, sam, psnr, ssim"
-            ),
-        },
-        FINAL_VALIDATION_METRICS_FILE,
-    )
-    print(
-        "Saved final complete-sampling validation metrics to: "
-        f"{FINAL_VALIDATION_METRICS_FILE}"
-    )
-
 
 # =============================================================================
 # Full-resolution five-image visualization
@@ -2503,7 +2331,7 @@ def evaluate_full_validation_inference(
       4. run the full reverse sampler via model.bridge.sample(...);
       5. clamp the prediction via the existing clamp_prediction() helper;
       6. crop back to the original resolution;
-      7. compute MRAE/RMSE/SAM/PSNR/SSIM through the imported loss modules via calculate_single_image_metrics().
+      7. compute MRAE/RMSE/SAM/PSNR/SSIM via calculate_single_image_metrics().
 
     Metrics are accumulated and averaged over the full validation dataset,
     then printed as a summary.
@@ -2704,14 +2532,11 @@ def main() -> None:
             validation_pairs=validation_pairs,
             device=device,
         )
-        if mode == "visualize":
-            # In train_visualize mode this was already run automatically at
-            # the end of training with the best checkpoint.
-            evaluate_full_validation_inference(
-                model=model,
-                validation_pairs=validation_pairs,
-                device=device,
-            )
+        evaluate_full_validation_inference(
+            model=model,
+            validation_pairs=validation_pairs,
+            device=device,
+        )
 
 
 if __name__ == "__main__":
