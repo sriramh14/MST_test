@@ -54,7 +54,7 @@ from torch.utils.data import DataLoader, Dataset
 # -----------------------------------------------------------------------------
 # Change this import path to match your project structure.
 # -----------------------------------------------------------------------------
-from model.BBDM_from_mstpp_rgb_conditioned import MSTPlusPlusBrownianBridge, extract
+from model.BBDM_from_mstpp import MSTPlusPlusBrownianBridge, extract
 
 
 # =============================================================================
