@@ -131,7 +131,7 @@ SKIP_SAMPLE = True
 SAMPLE_TYPE = "linear"
 SAMPLE_STEPS = 5
 LOSS_TYPE = "l1"
-OBJECTIVE = "grad"
+OBJECTIVE = "ysubx"
 
 # BBDM UNet settings.
 TRAIN_CROP_SIZE = 256
