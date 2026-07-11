@@ -22,10 +22,16 @@ into a single module and adapts it to the hyperspectral reconstruction setting:
     - This implementation uses the stable x_0-prediction parameterization:
       the U-Net predicts the clean HSI as mu plus a learned residual. The
       reverse recursion is the paper's residual form with pi_hat=x0_hat-mu.
+    - The denoiser additionally receives trainable features extracted directly
+      from the original RGB observation. This gives the bridge access to edges
+      and textures that may have been smoothed by the frozen MST++ estimate.
+    - Lightweight spectral residual blocks explicitly mix and refine adjacent
+      HSI channels near the input and output of the denoiser. An optional
+      spectral-gradient term preserves band-to-band spectral variation.
 
 Usage:
     model = RDBMHSI(mst_ckpt="path/to/mstplusplus.pth")
-    loss = model(rgb, gt_hsi)                 # training
+    loss = model(rgb, gt_hsi)                 # RGB-conditioned training
     hsi_pred = model.reconstruct(rgb)         # inference
 """
 
@@ -293,14 +299,40 @@ class Attention(nn.Module):
         return self.to_out(out)
 
 
+class SpectralResidualBlock(nn.Module):
+    """Lightweight residual mixing across hyperspectral channels.
+
+    A 1x1 convolution acts at every spatial location and mixes only the
+    channel/spectral dimension.  The final projection is zero-initialized, so
+    the block starts as an exact identity and can be added to an existing RDBM
+    training setup without initially disturbing its signal path.
+    """
+
+    def __init__(self, channels, hidden_channels=None):
+        super().__init__()
+        hidden_channels = default(hidden_channels, channels)
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, hidden_channels, 1),
+            nn.SiLU(),
+            nn.Conv2d(hidden_channels, channels, 1),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        if self.net[-1].bias is not None:
+            nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, x):
+        return x + self.net(x)
+
+
 class Unet(nn.Module):
     """
     Same U-Net architecture as the original RDBM (networks.py), with the
     default number of channels changed from 3 (RGB) to 31 (hyperspectral).
 
     `condition=True` concatenates the conditioning image `mu` (here: the
-    frozen MST++ prediction) with the noisy state `x_t` along the channel
-    dimension, exactly as in the original implementation.
+    frozen MST++ prediction) with the noisy state `x_t`.  When
+    `use_rgb_condition=True`, a trainable RGB adapter also provides a
+    31-channel spatial-detail condition derived from the original RGB image.
     """
 
     def __init__(
@@ -316,12 +348,49 @@ class Unet(nn.Module):
         random_fourier_features=False,
         learned_sinusoidal_dim=16,
         condition=True,               # True: residual bridge conditioned on mu
+        rgb_channels=3,
+        rgb_adapter_dim=32,
+        use_rgb_condition=True,
+        use_spectral_modeling=True,
     ):
         super().__init__()
 
         self.channels = channels
         self.depth = len(dim_mults)
-        input_channels = channels + channels * (1 if condition else 0)
+        self.condition = bool(condition)
+        self.use_rgb_condition = bool(use_rgb_condition)
+        self.use_spectral_modeling = bool(use_spectral_modeling)
+
+        # Explicit spectral mixing on the noisy HSI state and MST++ endpoint.
+        # Separate blocks are used because x_t and mu have different roles.
+        if self.use_spectral_modeling:
+            self.x_t_spectral = SpectralResidualBlock(channels)
+            self.mu_spectral = SpectralResidualBlock(channels)
+        else:
+            self.x_t_spectral = nn.Identity()
+            self.mu_spectral = nn.Identity()
+
+        # Direct RGB conditioning. The adapter is intentionally small: it maps
+        # RGB edges/textures to the same channel count as the HSI tensors.
+        if self.use_rgb_condition:
+            self.rgb_adapter = nn.Sequential(
+                nn.Conv2d(rgb_channels, rgb_adapter_dim, 3, padding=1),
+                nn.SiLU(),
+                nn.Conv2d(rgb_adapter_dim, channels, 3, padding=1),
+            )
+            # Start as a no-op RGB condition and learn its contribution
+            # gradually, which is more stable than injecting random features.
+            nn.init.zeros_(self.rgb_adapter[-1].weight)
+            if self.rgb_adapter[-1].bias is not None:
+                nn.init.zeros_(self.rgb_adapter[-1].bias)
+        else:
+            self.rgb_adapter = None
+
+        input_channels = channels
+        if self.condition:
+            input_channels += channels
+        if self.use_rgb_condition:
+            input_channels += channels
 
         init_dim = default(init_dim, dim)
         self.init_conv = nn.Conv2d(input_channels, init_dim, 7, padding=3)
@@ -385,6 +454,11 @@ class Unet(nn.Module):
 
         self.final_res_block = block_klass(dim * 2, dim, time_emb_dim=time_dim)
         self.final_conv = nn.Conv2d(dim, self.out_dim, 1)
+        self.output_spectral = (
+            SpectralResidualBlock(self.out_dim)
+            if self.use_spectral_modeling
+            else nn.Identity()
+        )
 
     def check_image_size(self, x, h, w):
         s = int(math.pow(2, self.depth))
@@ -393,14 +467,52 @@ class Unet(nn.Module):
         x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), 'reflect')
         return x
 
-    def forward(self, x_t, mu, time):
+    def forward(self, x_t, mu, time, rgb=None):
         """
         x_t : noisy HSI state at diffusion time `time`     [B, 31, H, W]
-        mu  : conditioning image, i.e. the frozen MST++    [B, 31, H, W]
-              prediction (analogue of the LQ image in the
-              original RDBM formulation)
+        mu  : frozen MST++ HSI prediction                  [B, 31, H, W]
+        rgb : original RGB observation                     [B,  3, H, W]
+
+        The RGB branch is trainable and is intentionally kept outside the
+        frozen MST++ forward pass. It supplies sharp spatial cues that may be
+        absent from `mu`.
         """
-        x = torch.cat((x_t, mu), dim=1)
+        if x_t.shape != mu.shape:
+            raise ValueError(
+                f'x_t shape {tuple(x_t.shape)} and mu shape '
+                f'{tuple(mu.shape)} must match.'
+            )
+        if x_t.ndim != 4 or x_t.shape[1] != self.channels:
+            raise ValueError(
+                f'x_t must have shape [B,{self.channels},H,W], '
+                f'got {tuple(x_t.shape)}.'
+            )
+
+        x_t_features = self.x_t_spectral(x_t)
+        mu_features = self.mu_spectral(mu)
+        conditions = [x_t_features]
+
+        if self.condition:
+            conditions.append(mu_features)
+
+        if self.use_rgb_condition:
+            if rgb is None:
+                raise ValueError(
+                    'rgb must be supplied when use_rgb_condition=True.'
+                )
+            if rgb.ndim != 4 or rgb.shape[1] != 3:
+                raise ValueError(
+                    f'rgb must have shape [B,3,H,W], got {tuple(rgb.shape)}.'
+                )
+            if rgb.shape[0] != x_t.shape[0] or rgb.shape[2:] != x_t.shape[2:]:
+                raise ValueError(
+                    f'rgb shape {tuple(rgb.shape)} is incompatible with '
+                    f'x_t shape {tuple(x_t.shape)}.'
+                )
+            rgb_features = self.rgb_adapter(rgb)
+            conditions.append(rgb_features)
+
+        x = torch.cat(conditions, dim=1)
         H, W = x.shape[2:]
         x = self.check_image_size(x, H, W)
         x = self.init_conv(x)
@@ -435,13 +547,15 @@ class Unet(nn.Module):
             x = upsample(x)
 
         x = torch.cat((x, r), dim=1)
-
         x = self.final_res_block(x, t)
         x = self.final_conv(x)
+        x = self.output_spectral(x)
         x = x[..., :H, :W].contiguous()
+
         # x is the learned clean residual pi_hat. Adding the fixed endpoint
         # mu yields an x0 prediction: x0_hat = mu + pi_hat.
         return x + mu
+
 
 
 # =========================================================================
@@ -477,6 +591,7 @@ class RDBM(nn.Module):
         condition=True,
         lamb=10.0 / 255.0,
         loss_type='l1',
+        spectral_gradient_weight=0.05,
     ):
         super().__init__()
 
@@ -501,6 +616,8 @@ class RDBM(nn.Module):
             raise ValueError('lamb must be positive.')
         if loss_type not in {'l1', 'l2'}:
             raise ValueError("loss_type must be either 'l1' or 'l2'.")
+        if spectral_gradient_weight < 0:
+            raise ValueError('spectral_gradient_weight must be non-negative.')
         if not condition:
             raise ValueError('RDBMHSI requires condition=True.')
 
@@ -514,6 +631,7 @@ class RDBM(nn.Module):
         self.sampling_timesteps = int(sampling_timesteps)
         self.lamb = float(lamb)
         self.loss_type = loss_type
+        self.spectral_gradient_weight = float(spectral_gradient_weight)
 
         thetas = betas_for_alpha_bar(self.num_timesteps)
         thetas_cumsum_0_to_t = thetas.cumsum(dim=0)
@@ -551,9 +669,11 @@ class RDBM(nn.Module):
         register_buffer('Sigma2', Sigma2)
         register_buffer('Sigma', Sigma)
 
-    def model_predictions(self, x_t, mu, t, clip_denoised=False):
+    def model_predictions(
+        self, x_t, mu, t, rgb_condition, clip_denoised=False
+    ):
         """Predict x0 without deriving a noise estimate at Sigma_T=0."""
-        x_start = self.model(x_t, mu, t)
+        x_start = self.model(x_t, mu, t, rgb=rgb_condition)
 
         if clip_denoised:
             x_start = x_start.clamp(-1.0, 1.0)
@@ -561,7 +681,7 @@ class RDBM(nn.Module):
         return ModelResPrediction(pred_noise=None, pred_x_start=x_start)
 
     @torch.no_grad()
-    def ddim_sample(self, mu, shape, last=True):
+    def ddim_sample(self, mu, shape, rgb_condition, last=True):
         """Deterministic reverse recursion from the endpoint ``mu`` to x0."""
         if tuple(mu.shape) != tuple(shape):
             raise ValueError(
@@ -595,7 +715,7 @@ class RDBM(nn.Module):
                 (batch,), time, device=device, dtype=torch.long
             )
             x_start = self.model_predictions(
-                img, mu, time_cond
+                img, mu, time_cond, rgb_condition=rgb_condition
             ).pred_x_start
 
             if time_next < 0:
@@ -629,7 +749,9 @@ class RDBM(nn.Module):
             return [mu, img]
         return [mu, *trajectory]
 
-    def sample(self, x_input=None, gt=None, batch_size=16, last=True):
+    def sample(
+        self, x_input=None, rgb_condition=None, gt=None, batch_size=16, last=True
+    ):
         del gt, batch_size  # retained in the signature for backward compatibility
 
         if x_input is None:
@@ -642,8 +764,22 @@ class RDBM(nn.Module):
             raise ValueError(
                 f'Expected {self.channels} HSI channels, got {x_input.shape[1]}.'
             )
+        if rgb_condition is None:
+            raise ValueError('rgb_condition is required for RGB-conditioned sampling.')
+        if (
+            rgb_condition.ndim != 4
+            or rgb_condition.shape[1] != 3
+            or rgb_condition.shape[0] != x_input.shape[0]
+            or rgb_condition.shape[2:] != x_input.shape[2:]
+        ):
+            raise ValueError(
+                f'rgb_condition shape {tuple(rgb_condition.shape)} is incompatible '
+                f'with x_input shape {tuple(x_input.shape)}.'
+            )
 
-        return self.ddim_sample(x_input, tuple(x_input.shape), last=last)
+        return self.ddim_sample(
+            x_input, tuple(x_input.shape), rgb_condition=rgb_condition, last=last
+        )
 
     def q_sample(self, x_start, mu, t, noise=None):
         """Sample the paper's residual-modulated forward bridge q(x_t|x0,mu)."""
@@ -667,17 +803,36 @@ class RDBM(nn.Module):
         # Crucial RDBM term: residual also modulates the noise amplitude.
         return mu + residual * theta_t + residual * sigma_t * noise
 
+    @staticmethod
+    def spectral_gradient_loss(prediction, target):
+        """Preserve first-order variation between neighbouring HSI bands."""
+        if prediction.shape[1] < 2:
+            return prediction.new_zeros(())
+        prediction_gradient = prediction[:, 1:] - prediction[:, :-1]
+        target_gradient = target[:, 1:] - target[:, :-1]
+        return F.l1_loss(prediction_gradient, target_gradient)
+
     def _loss(self, prediction, target):
         if self.loss_type == 'l1':
-            return F.l1_loss(prediction, target)
-        return F.mse_loss(prediction, target)
+            reconstruction_loss = F.l1_loss(prediction, target)
+        else:
+            reconstruction_loss = F.mse_loss(prediction, target)
+
+        if self.spectral_gradient_weight == 0:
+            return reconstruction_loss
+
+        spectral_loss = self.spectral_gradient_loss(prediction, target)
+        return (
+            reconstruction_loss
+            + self.spectral_gradient_weight * spectral_loss
+        )
 
     def p_losses(self, imgs, t, noise=None):
-        # imgs = [x_start (GT HSI), mu (frozen MST++ prediction)]
-        if not isinstance(imgs, (list, tuple)) or len(imgs) != 2:
-            raise ValueError('imgs must be [gt_hsi, mu].')
+        # imgs = [x_start (GT HSI), mu (MST++ prediction), rgb]
+        if not isinstance(imgs, (list, tuple)) or len(imgs) != 3:
+            raise ValueError('imgs must be [gt_hsi, mu, rgb].')
 
-        x_start, mu = imgs
+        x_start, mu, rgb_condition = imgs
         if x_start.shape != mu.shape:
             raise ValueError(
                 f'GT HSI shape {tuple(x_start.shape)} does not match MST++ '
@@ -690,12 +845,12 @@ class RDBM(nn.Module):
         # x0-prediction parameterization. Since Unet.forward returns
         # mu + predicted_residual, this is equivalent to supervising the
         # predicted clean residual against x_start - mu.
-        x_start_pred = self.model(x_t, mu, t)
+        x_start_pred = self.model(x_t, mu, t, rgb=rgb_condition)
         return self._loss(x_start_pred, x_start)
 
     def forward(self, img, *args, **kwargs):
-        if not isinstance(img, (list, tuple)) or len(img) != 2:
-            raise ValueError('img must be [gt_hsi, mu].')
+        if not isinstance(img, (list, tuple)) or len(img) != 3:
+            raise ValueError('img must be [gt_hsi, mu, rgb].')
 
         x_start = img[0]
         if x_start.ndim != 4:
@@ -753,6 +908,10 @@ class RDBMHSI(nn.Module):
         sampling_type='pred_x_start',
         lamb=10.0 / 255.0,
         loss_type='l1',
+        spectral_gradient_weight=0.05,
+        rgb_adapter_dim=32,
+        use_rgb_condition=True,
+        use_spectral_modeling=True,
         mst_kwargs=None,
         mst_strict=True,
         check_finite=False,
@@ -769,6 +928,8 @@ class RDBMHSI(nn.Module):
 
         self.check_finite = bool(check_finite)
         self.hsi_channels = int(hsi_channels)
+        self.use_rgb_condition = bool(use_rgb_condition)
+        self.use_spectral_modeling = bool(use_spectral_modeling)
 
         self.mst.eval()
         for p in self.mst.parameters():
@@ -780,6 +941,10 @@ class RDBMHSI(nn.Module):
             dim_mults=dim_mults,
             channels=hsi_channels,
             condition=True,
+            rgb_channels=3,
+            rgb_adapter_dim=rgb_adapter_dim,
+            use_rgb_condition=use_rgb_condition,
+            use_spectral_modeling=use_spectral_modeling,
         )
         self.rdbm = RDBM(
             model=self.unet,
@@ -791,6 +956,7 @@ class RDBMHSI(nn.Module):
             condition=True,
             lamb=lamb,
             loss_type=loss_type,
+            spectral_gradient_weight=spectral_gradient_weight,
         )
 
     @staticmethod
@@ -891,7 +1057,7 @@ class RDBMHSI(nn.Module):
                 f'shape {tuple(gt_hsi.shape)}.'
             )
 
-        return self.rdbm([gt_hsi, mu])
+        return self.rdbm([gt_hsi, mu, rgb])
 
     @torch.no_grad()
     def reconstruct(self, rgb, last=True):
@@ -901,7 +1067,9 @@ class RDBMHSI(nn.Module):
         hyperspectral reconstruction: hsi_pred = mu + predicted_residual.
         """
         mu = self._frozen_mst_predict(rgb)
-        samples = self.rdbm.sample(x_input=mu, last=last)
+        samples = self.rdbm.sample(
+            x_input=mu, rgb_condition=rgb, last=last
+        )
 
         # Preserve the convenient tensor return for normal inference, while
         # returning the complete trajectory when explicitly requested.
