@@ -14,6 +14,10 @@ Bridge endpoints:
     x0 = ground-truth HSI
     y  = frozen MST++ coarse HSI estimate
 
+UNet conditioning when condition_key != "nocond":
+    context = concat(frozen MST++ coarse HSI, raw RGB) along channels
+              [B, hsi_channels + 3, H, W]
+
 Edit the MST++ import below to match your project.
 """
 
@@ -39,10 +43,7 @@ from tqdm.autonotebook import tqdm
 # Example:
 from .MST_Plus_Plus import MST_Plus_Plus
 # ---------------------------------------------------------------------------
-#try:
-    #from model.mst_plus_plus import MST_Plus_Plus  # type: ignore
-#except ImportError:
-    #MST_Plus_Plus = None
+
 
 
 # ===========================================================================
@@ -514,10 +515,10 @@ class AttentionBlock(nn.Module):
 
 class ContextBlock(nn.Module):
     """
-    Inject the full MST++ prediction without collapsing the spectral dimension.
+    Inject the combined MST++ coarse HSI + RGB condition without collapsing channels.
     """
 
-    def __init__(self, channels: int, context_channels: int = 31):
+    def __init__(self, channels: int, context_channels: int = 34):
         super().__init__()
 
         self.proj = nn.Sequential(
@@ -588,6 +589,7 @@ class UNetModel(nn.Module):
         n_embed: Optional[int] = None,
         legacy: bool = True,
         condition_key: str = "nocond",
+        context_channels: Optional[int] = None,
         **kwargs: Any,
     ):
         super().__init__()
@@ -625,6 +627,7 @@ class UNetModel(nn.Module):
         self.out_channels = out_channels
         self.num_res_blocks = num_res_blocks
         self.condition_key = condition_key
+        self.context_channels = int(context_channels) if context_channels is not None else in_channels + 3
         self.dtype = torch.float32
 
         time_embed_dim = model_channels * 4
@@ -671,7 +674,7 @@ class UNetModel(nn.Module):
                         )
                     )
                 if use_spatial_transformer or condition_key != "nocond":
-                    layers.append(ContextBlock(channel))
+                    layers.append(ContextBlock(channel, context_channels=self.context_channels))
 
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
                 input_block_channels.append(channel)
@@ -717,7 +720,7 @@ class UNetModel(nn.Module):
             ),
         ]
         if use_spatial_transformer or condition_key != "nocond":
-            middle_layers.append(ContextBlock(channel))
+            middle_layers.append(ContextBlock(channel, context_channels=self.context_channels))
         middle_layers.append(
             ResBlock(
                 channel,
@@ -758,7 +761,7 @@ class UNetModel(nn.Module):
                         )
                     )
                 if use_spatial_transformer or condition_key != "nocond":
-                    layers.append(ContextBlock(channel))
+                    layers.append(ContextBlock(channel, context_channels=self.context_channels))
 
                 if level and block_index == num_res_blocks:
                     if resblock_updown:
@@ -1411,6 +1414,49 @@ class MSTPlusPlusBrownianBridge(nn.Module):
                 f"endpoint has {coarse.shape[1]} channels."
             )
 
+    def _make_bridge_context(
+        self,
+        coarse: torch.Tensor,
+        rgb: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Create UNet conditioning from MST++ coarse HSI and raw RGB.
+
+        When conditioning is enabled, the context passed to every ContextBlock is:
+            [coarse_hsi, rgb] along the channel dimension.
+        For a 31-channel HSI target, this gives 34 context channels.
+        """
+        if self.bridge.condition_key == "nocond":
+            return None
+        if context is not None:
+            return context
+
+        rgb_condition = rgb.detach().to(
+            device=coarse.device,
+            dtype=coarse.dtype,
+        )
+        if rgb_condition.shape[-2:] != coarse.shape[-2:]:
+            rgb_condition = F.interpolate(
+                rgb_condition,
+                size=coarse.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        if rgb_condition.shape[0] != coarse.shape[0]:
+            raise ValueError(
+                "RGB condition and MST++ coarse estimate must have the same "
+                f"batch size, got rgb={rgb_condition.shape[0]} and "
+                f"coarse={coarse.shape[0]}."
+            )
+        if rgb_condition.shape[1] != 3:
+            raise ValueError(
+                "RGB condition is expected to have 3 channels, got "
+                f"{rgb_condition.shape[1]}."
+            )
+
+        return torch.cat([coarse, rgb_condition], dim=1).contiguous()
+
     def forward(
         self,
         rgb: torch.Tensor,
@@ -1419,11 +1465,16 @@ class MSTPlusPlusBrownianBridge(nn.Module):
     ) -> Tuple[torch.Tensor, dict[str, torch.Tensor]]:
         coarse = self.coarse_estimate(rgb)
         self._validate_endpoints(coarse, ground_truth)
+        bridge_context = self._make_bridge_context(
+            coarse=coarse,
+            rgb=rgb,
+            context=context,
+        )
 
         loss, log_dict = self.bridge(
             x=ground_truth,
             y=coarse,
-            context=context,
+            context=bridge_context,
         )
         log_dict["coarse_estimate"] = coarse
         return loss, log_dict
@@ -1440,9 +1491,14 @@ class MSTPlusPlusBrownianBridge(nn.Module):
         Tuple[list[torch.Tensor], list[torch.Tensor]],
     ]:
         coarse = self.coarse_estimate(rgb)
+        bridge_context = self._make_bridge_context(
+            coarse=coarse,
+            rgb=rgb,
+            context=context,
+        )
         return self.bridge.sample(
             y=coarse,
-            context=context,
+            context=bridge_context,
             clip_denoised=clip_denoised,
             sample_mid_step=sample_mid_step,
         )
