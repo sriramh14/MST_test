@@ -19,6 +19,7 @@ This script imports the self-contained model created previously:
 
 The model uses:
     ground-truth HSI x0 <-> frozen MST++ coarse HSI y
+    UNet condition = concatenated [MST++ coarse HSI, raw RGB]
 
 Training:
     loss, log_dict = model(rgb=rgb, ground_truth=hsi)
@@ -53,7 +54,7 @@ from torch.utils.data import DataLoader, Dataset
 # -----------------------------------------------------------------------------
 # Change this import path to match your project structure.
 # -----------------------------------------------------------------------------
-from model.BBDM_from_mstpp import MSTPlusPlusBrownianBridge, extract
+from model.BBDM_from_mstpp_rgb_conditioned import MSTPlusPlusBrownianBridge, extract
 
 
 # =============================================================================
@@ -130,7 +131,7 @@ SKIP_SAMPLE = True
 SAMPLE_TYPE = "linear"
 SAMPLE_STEPS = 5
 LOSS_TYPE = "l1"
-OBJECTIVE = "ysubx"
+OBJECTIVE = "grad"
 
 # BBDM UNet settings.
 TRAIN_CROP_SIZE = 256
@@ -160,7 +161,7 @@ USE_AUGMENTATION = True
 # Training settings.
 BATCH_SIZE = 2
 VALIDATION_BATCH_SIZE = 2
-NUM_EPOCHS = 40
+NUM_EPOCHS = 10
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 MIN_LEARNING_RATE = 1e-7
@@ -186,8 +187,8 @@ SAM_EPSILON = 1e-8
 SSIM_WINDOW_SIZE = 11
 SSIM_SIGMA = 1.5
 
-# Checkpoint selection. Lower validation MRAE is considered better.
-BEST_METRIC_NAME = "loss"  # one-step x_t MRAE during validation
+# Checkpoint selection. Lower validation BBDM objective loss is better.
+BEST_METRIC_NAME = "loss"
 
 # Visualization settings.
 NUM_VISUALIZATION_IMAGES = 5
@@ -1748,10 +1749,10 @@ def validate_one_epoch(
             dtype=torch.float32,
         )
 
-        context = (
-            None
-            if model.bridge.condition_key == "nocond"
-            else coarse
+        context = model._make_bridge_context(
+            coarse=coarse,
+            rgb=rgb,
+            context=None,
         )
 
         true_xt, objective = model.bridge.q_sample(
@@ -2179,10 +2180,10 @@ def run_visualization(
             rgb_batch
         ).float()
 
-        context = (
-            None
-            if model.bridge.condition_key == "nocond"
-            else coarse_prediction
+        context = model._make_bridge_context(
+            coarse=coarse_prediction,
+            rgb=rgb_batch,
+            context=None,
         )
         bridge_prediction = model.bridge.sample(
             y=coarse_prediction,
@@ -2399,10 +2400,10 @@ def evaluate_full_validation_inference(
             rgb_batch
         ).float()
 
-        context = (
-            None
-            if model.bridge.condition_key == "nocond"
-            else coarse_prediction
+        context = model._make_bridge_context(
+            coarse=coarse_prediction,
+            rgb=rgb_batch,
+            context=None,
         )
         bridge_prediction = model.bridge.sample(
             y=coarse_prediction,
