@@ -336,11 +336,10 @@ class MST_Plus_Plus_Diffusion(nn.Module):
 
     @staticmethod
     def _is_cudnn_engine_error(error: RuntimeError) -> bool:
-        message = str(error).lower()
-        return (
-            "unable to find an engine" in message
-            or "get was unable" in message
-        )
+        # Delegates to the module-level helper (defined further down this
+        # file) so forward() and the training-step guard share one
+        # definition of what counts as this error.
+        return is_cudnn_engine_error(error)
 
     def forward(
         self,
@@ -355,10 +354,17 @@ class MST_Plus_Plus_Diffusion(nn.Module):
         context: accepted for interface compatibility, unused.
         return out: [b,c,h,w] -- same shape/semantics as the objective the
         Brownian Bridge expects (noise / grad / ysubx, per config).
+
+        Note: this only guards *forward*. cuDNN's "unable to find an
+        engine" error can also surface later, during loss.backward() in
+        the training loop, since forward and backward convolutions go
+        through separate cuDNN engine selection. That case can't be
+        caught here -- wrap your training step in
+        `run_train_step_with_cudnn_guard` (defined below) as well.
         """
         del context, extra
 
-        if self._disable_cudnn_after_engine_error and x.is_cuda:
+        if (self._disable_cudnn_after_engine_error or _CUDNN_ENGINE_ERROR_SEEN) and x.is_cuda:
             with torch.backends.cudnn.flags(enabled=False):
                 return self._forward_impl(x, timesteps)
 
@@ -374,6 +380,7 @@ class MST_Plus_Plus_Diffusion(nn.Module):
             # MST++ coarse-estimate fallback.
             torch.cuda.synchronize(x.device)
             self._disable_cudnn_after_engine_error = True
+            disable_cudnn_globally()
             with torch.backends.cudnn.flags(enabled=False):
                 return self._forward_impl(x, timesteps)
 
@@ -405,6 +412,79 @@ class MST_Plus_Plus_Diffusion(nn.Module):
 # ===========================================================================
 # Basic utilities
 # ===========================================================================
+
+_CUDNN_ENGINE_ERROR_SEEN = False
+
+
+def is_cudnn_engine_error(error: BaseException) -> bool:
+    """True if `error` is PyTorch/cuDNN's 'no engine found' RuntimeError.
+
+    Seen on some Kaggle CUDA/cuDNN builds as:
+        RuntimeError: GET was unable to find an engine to execute this computation
+    """
+    message = str(error).lower()
+    return "unable to find an engine" in message or "get was unable" in message
+
+
+def disable_cudnn_globally() -> None:
+    """Turn cuDNN off for the rest of the process. Idempotent.
+
+    The engine-selection failure is a property of the installed CUDA/cuDNN
+    build for a given convolution *shape*, not of one particular nn.Module
+    instance. A fallback scoped to a single module's forward() (like the
+    one below in the timestep-conditioned MST++ body) does not protect
+    that same module's later backward() call, nor any other convolution
+    in the process that happens to trip the same cuDNN heuristic bug. So
+    once this error is seen anywhere, cuDNN is disabled process-wide
+    rather than only inside the module that first hit it.
+    """
+    global _CUDNN_ENGINE_ERROR_SEEN
+    if not _CUDNN_ENGINE_ERROR_SEEN:
+        torch.backends.cudnn.enabled = False
+        _CUDNN_ENGINE_ERROR_SEEN = True
+
+
+def run_train_step_with_cudnn_guard(step_fn: Callable[[], Any]) -> Any:
+    """Run one full training step, retrying once with cuDNN disabled if it
+    hits the 'GET was unable to find an engine' error.
+
+    IMPORTANT: `step_fn` must perform the *entire* step -- zero_grad,
+    forward, loss computation, and backward() (and optimizer/scaler step,
+    if you want the retry to also cover that). It is not safe to retry
+    only `.backward()` in isolation: once backward() raises partway
+    through, autograd has already freed some saved tensors from nodes
+    that did complete, so the graph can't be replayed from where it left
+    off. The whole step -- including a fresh forward -- must be redone.
+
+    Typical usage inside train_one_epoch, replacing:
+
+        optimizer.zero_grad()
+        loss = compute_loss(batch)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+    with:
+
+        def _step():
+            optimizer.zero_grad()
+            loss = compute_loss(batch)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            return loss
+
+        loss = run_train_step_with_cudnn_guard(_step)
+    """
+    try:
+        return step_fn()
+    except RuntimeError as error:
+        if not torch.cuda.is_available() or not is_cudnn_engine_error(error):
+            raise
+        torch.cuda.synchronize()
+        disable_cudnn_globally()
+        return step_fn()
+
 
 def exists(value: Any) -> bool:
     return value is not None
