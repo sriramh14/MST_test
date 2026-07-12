@@ -326,6 +326,22 @@ class MST_Plus_Plus_Diffusion(nn.Module):
         ])
         self.conv_out = nn.Conv2d(n_feat, out_channels, kernel_size=3, padding=(3 - 1) // 2, bias=False)
 
+        # Some Kaggle CUDA/cuDNN builds cannot select a cuDNN engine for the
+        # depthwise/positional convolution inside MS_MSA.pos_emb, raising
+        # "GET was unable to find an engine to execute this computation".
+        # Once seen, every later forward call goes straight to the cuDNN-
+        # disabled path instead of re-attempting (and re-failing) the cuDNN
+        # path every training step.
+        self._disable_cudnn_after_engine_error = False
+
+    @staticmethod
+    def _is_cudnn_engine_error(error: RuntimeError) -> bool:
+        message = str(error).lower()
+        return (
+            "unable to find an engine" in message
+            or "get was unable" in message
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -342,6 +358,30 @@ class MST_Plus_Plus_Diffusion(nn.Module):
         """
         del context, extra
 
+        if self._disable_cudnn_after_engine_error and x.is_cuda:
+            with torch.backends.cudnn.flags(enabled=False):
+                return self._forward_impl(x, timesteps)
+
+        try:
+            return self._forward_impl(x, timesteps)
+        except RuntimeError as error:
+            if not x.is_cuda or not self._is_cudnn_engine_error(error):
+                raise
+
+            # Retry once with cuDNN disabled for this process, using the
+            # native convolution implementation instead. Gradients are kept
+            # intact -- this is not a no_grad context, unlike the frozen
+            # MST++ coarse-estimate fallback.
+            torch.cuda.synchronize(x.device)
+            self._disable_cudnn_after_engine_error = True
+            with torch.backends.cudnn.flags(enabled=False):
+                return self._forward_impl(x, timesteps)
+
+    def _forward_impl(
+        self,
+        x: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
         b, c, h_inp, w_inp = x.shape
         hb, wb = 8, 8
         pad_h = (hb - h_inp % hb) % hb
