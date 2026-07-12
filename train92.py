@@ -156,7 +156,7 @@ MSTPP_DIFFUSION_MODEL_CHANNELS = 16
 
 # Number of stacked MST modules in the MST++ body (same meaning as MST_Plus_Plus's
 # `stage` argument).
-MSTPP_DIFFUSION_STAGE = 3
+MSTPP_DIFFUSION_STAGE = 1
 
 # Encoder/decoder depth *inside* each stacked MST module (same meaning as the
 # inner MST class's `stage` argument).
