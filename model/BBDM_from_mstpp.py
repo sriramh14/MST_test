@@ -53,17 +53,8 @@ from torch.utils.checkpoint import checkpoint as torch_gradient_checkpoint
 from tqdm.autonotebook import tqdm
 
 
-# ---------------------------------------------------------------------------
-# EDIT THIS IMPORT TO MATCH YOUR MST++ IMPLEMENTATION.
-# Example:
 from .MST_Plus_Plus import MST_Plus_Plus,GELU, PreNorm, FeedForward, MS_MSA, trunc_normal_
 
-# Timestep-conditioned MST++ used as the Brownian Bridge denoise_fn. This is
-# a separate class from the frozen coarse-estimate MST_Plus_Plus above: same
-# MST++ encoder/decoder/attention architecture, plus timestep conditioning.
-# EDIT THIS IMPORT TO MATCH YOUR MST++ DIFFUSION IMPLEMENTATION.
-#from .MST_Plus_Plus_Diffusion import MST_Plus_Plus_Diffusion
-# ---------------------------------------------------------------------------
 
 
 
