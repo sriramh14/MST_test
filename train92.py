@@ -181,7 +181,7 @@ CONDITION_KEY = "concat"
 MODEL_DOWNSAMPLE_FACTOR = 8
 
 # Dataset and augmentation settings.
-PATCHES_PER_IMAGE = 2
+PATCHES_PER_IMAGE = 1
 USE_AUGMENTATION = False
 
 # Training settings.
