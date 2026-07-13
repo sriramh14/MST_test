@@ -21,19 +21,20 @@ What is added, and nothing else:
       / BBDM UNets).
     - `FiLM`: a lightweight scale-shift modulation layer. It is applied once
       to the feature map immediately before each MSAB block (encoder,
-      bottleneck, and decoder), and is zero-initialized so the model starts
-      out as an identity-conditioned MST++ (scale=0 -> multiplier 1,
-      shift=0), and only learns to use timestep information during training.
+      bottleneck, and decoder), and is initialized extremely close to identity
+      while remaining nonzero so timestep information can train immediately.
+    - Active coarse-HSI + RGB context injection before every stacked MST stage.
+      The denoiser therefore receives the bridge endpoint and RGB measurement
+      during both training and reverse sampling.
 
 Public interface (matches the BBDM UNetModel call signature exactly so no
 other part of the Brownian Bridge code needs to change):
 
     forward(x, timesteps, context=None) -> torch.Tensor
 
-`context` is accepted purely for interface compatibility with
-BrownianBridgeModel's ContextBlock-based conditioning API. It is not wired
-into this MST++ denoiser and is simply ignored, as permitted by the
-requested interface.
+`context` follows the BrownianBridgeModel conditioning API. When conditioning
+is enabled it is expected to contain the concatenated coarse HSI + RGB tensor
+and is injected into the active MST++ diffusion feature stream.
 """
 
 from __future__ import annotations
@@ -53,8 +54,17 @@ from torch.utils.checkpoint import checkpoint as torch_gradient_checkpoint
 from tqdm.autonotebook import tqdm
 
 
+# ---------------------------------------------------------------------------
+# EDIT THIS IMPORT TO MATCH YOUR MST++ IMPLEMENTATION.
+# Example:
 from .MST_Plus_Plus import MST_Plus_Plus,GELU, PreNorm, FeedForward, MS_MSA, trunc_normal_
 
+# Timestep-conditioned MST++ used as the Brownian Bridge denoise_fn. This is
+# a separate class from the frozen coarse-estimate MST_Plus_Plus above: same
+# MST++ encoder/decoder/attention architecture, plus timestep conditioning.
+# EDIT THIS IMPORT TO MATCH YOUR MST++ DIFFUSION IMPLEMENTATION.
+#from .MST_Plus_Plus_Diffusion import MST_Plus_Plus_Diffusion
+# ---------------------------------------------------------------------------
 
 
 
@@ -102,10 +112,9 @@ class FiLM(nn.Module):
     Lightweight scale-shift (FiLM) conditioning, applied additively/
     multiplicatively to a channel-last feature map [b, h, w, c].
 
-    Zero-initialized so that, at the start of training, this layer is the
-    identity function (scale=0 -> multiplier 1, shift=0) and does not alter
-    the original MST++ computation graph until it learns to use timestep
-    information.
+    Near-identity initialized. The projection weights start extremely small
+    instead of exactly zero so timestep information can influence the network
+    from the first optimization step without strongly perturbing the features.
     """
 
     def __init__(self, time_embed_dim: int, channels: int):
@@ -123,6 +132,54 @@ class FiLM(nn.Module):
         scale = scale[:, None, None, :]
         shift = shift[:, None, None, :]
         return x * (1 + scale) + shift
+
+
+class DiffusionContextInjection(nn.Module):
+    """
+    Project coarse-HSI + RGB context into the active MST diffusion feature
+    stream without collapsing spectral channels.
+
+    The residual gate starts small (0.1), so context is available immediately
+    during training and sampling while the original feature stream remains
+    dominant at initialization.
+    """
+
+    def __init__(self, context_channels: int, channels: int):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Conv2d(context_channels, channels, kernel_size=1, bias=False),
+            nn.SiLU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+        )
+        self.gate = nn.Parameter(torch.full((1, channels, 1, 1), 0.1))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        context: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if context is None:
+            return x
+        if context.ndim != 4:
+            raise ValueError(
+                f"Diffusion context must be NCHW, got shape {tuple(context.shape)}."
+            )
+        if context.shape[1] != self.proj[0].in_channels:
+            raise ValueError(
+                "Diffusion context channel mismatch: expected "
+                f"{self.proj[0].in_channels}, got {context.shape[1]}."
+            )
+
+        if context.shape[-2:] != x.shape[-2:]:
+            context = F.interpolate(
+                context,
+                size=x.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        context_features = self.proj(context.to(dtype=x.dtype))
+        return x + self.gate.to(dtype=x.dtype) * context_features
 
 
 # ===========================================================================
@@ -218,7 +275,7 @@ class MSTDiffusion(nn.Module):
 
         self.lrelu = nn.LeakyReLU(negative_slope=0.1, inplace=True)
         self.apply(self._init_weights)
-        self._zero_init_film()
+        self._init_film_near_identity()
 
     def _init_weights(self, m: nn.Module) -> None:
         if isinstance(m, nn.Linear):
@@ -229,12 +286,13 @@ class MSTDiffusion(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def _zero_init_film(self) -> None:
-        # self._init_weights above overwrites every nn.Linear, including the
-        # FiLM projections. Re-zero them so FiLM starts as an identity map.
+    def _init_film_near_identity(self) -> None:
+        # Do not zero timestep conditioning completely. A tiny initialization
+        # keeps FiLM near identity while allowing timestep features to receive
+        # useful gradients from the beginning of training.
         for module in self.modules():
             if isinstance(module, FiLM):
-                nn.init.zeros_(module.proj.weight)
+                nn.init.normal_(module.proj.weight, mean=0.0, std=1e-4)
                 nn.init.zeros_(module.proj.bias)
 
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
@@ -261,8 +319,10 @@ class MSTDiffusion(nn.Module):
             fea = fution(torch.cat([fea, fea_encoder[self.stage - 1 - i]], dim=1))
             fea = le_win_block(fea, time_emb)
 
-        # Mapping
-        out = self.mapping(fea) + x
+        # Objective-feature mapping. Do not add the image/features back here:
+        # this MST block is used inside a diffusion objective predictor rather
+        # than as an RGB->HSI image reconstruction stage.
+        out = self.mapping(fea)
 
         return out
 
@@ -271,14 +331,13 @@ class MST_Plus_Plus_Diffusion(nn.Module):
     """
     Timestep-conditioned MST++, used as the Brownian Bridge `denoise_fn`.
 
-    Same stacked-MST body, encoder/decoder structure, transformer blocks,
-    attention mechanism and skip connections as MST_Plus_Plus. The only
-    addition is a sinusoidal-timestep-embedding + MLP whose output
-    FiLM-modulates the feature map immediately before every MSAB block.
+    Uses the MST spectral attention encoder/decoder as a Brownian-bridge
+    objective predictor rather than as an image reconstructor.
 
-    forward(x, timesteps, context=None) matches the BBDM UNetModel
-    interface exactly. `context` is accepted for interface compatibility
-    with BrownianBridgeModel's conditioning API but is not used.
+    Timestep embeddings FiLM-modulate every MSAB. When conditioning is enabled,
+    the 31-channel coarse HSI + 3-channel RGB context is projected and injected
+    before every stacked MST refinement stage, so the same endpoint/measurement
+    information is available during both training and reverse sampling.
 
     Constructor accepts **kwargs so a BBDM UNetParams object (via
     vars(UNetParams)) can be passed directly, even though most UNetParams
@@ -296,6 +355,8 @@ class MST_Plus_Plus_Diffusion(nn.Module):
         mst_stage: int = 2,
         mst_num_blocks: Sequence[int] = (1, 1, 1),
         model_channels: int = 128,
+        condition_key: str = "nocond",
+        context_channels: Optional[int] = None,
         **kwargs: Any,
     ):
         super().__init__()
@@ -303,19 +364,58 @@ class MST_Plus_Plus_Diffusion(nn.Module):
 
         self.stage = stage
         self.model_channels = model_channels
+        self.condition_key = condition_key
+        self.context_channels = (
+            int(context_channels)
+            if context_channels is not None
+            else in_channels + 3
+        )
+        self.use_context = condition_key != "nocond"
 
         time_embed_dim = model_channels * 4
-        self.time_embedder = TimestepEmbedder(dim=model_channels, hidden_dim=time_embed_dim)
+        self.time_embedder = TimestepEmbedder(
+            dim=model_channels,
+            hidden_dim=time_embed_dim,
+        )
 
-        self.conv_in = nn.Conv2d(in_channels, n_feat, kernel_size=3, padding=(3 - 1) // 2, bias=False)
+        self.conv_in = nn.Conv2d(
+            in_channels,
+            n_feat,
+            kernel_size=3,
+            padding=1,
+            bias=False,
+        )
         self.body = nn.ModuleList([
             MSTDiffusion(
-                dim=31, in_dim=31, out_dim=31, stage=mst_stage,
-                num_blocks=list(mst_num_blocks), time_embed_dim=time_embed_dim,
+                dim=n_feat,
+                in_dim=n_feat,
+                out_dim=n_feat,
+                stage=mst_stage,
+                num_blocks=list(mst_num_blocks),
+                time_embed_dim=time_embed_dim,
             )
             for _ in range(stage)
         ])
-        self.conv_out = nn.Conv2d(n_feat, out_channels, kernel_size=3, padding=(3 - 1) // 2, bias=False)
+
+        # The same coarse-HSI + RGB condition is injected before every stacked
+        # MST stage. This keeps endpoint/measurement information available at
+        # training and sampling time instead of discarding `context`.
+        self.context_injections = nn.ModuleList([
+            DiffusionContextInjection(self.context_channels, n_feat)
+            for _ in range(stage)
+        ]) if self.use_context else nn.ModuleList([])
+
+        # Predict the Brownian objective directly. Use a very small output-head
+        # initialization: the initial prediction stays near zero without
+        # blocking first-step gradients to the MST body and timestep FiLM.
+        self.conv_out = nn.Conv2d(
+            n_feat,
+            out_channels,
+            kernel_size=3,
+            padding=1,
+            bias=False,
+        )
+        nn.init.normal_(self.conv_out.weight, mean=0.0, std=1e-4)
 
         # Some Kaggle CUDA/cuDNN builds cannot select a cuDNN engine for the
         # depthwise/positional convolution inside MS_MSA.pos_emb, raising
@@ -342,7 +442,7 @@ class MST_Plus_Plus_Diffusion(nn.Module):
         """
         x: [b,c,h,w]
         timesteps: [b]
-        context: accepted for interface compatibility, unused.
+        context: coarse-HSI + RGB condition when conditioning is enabled.
         return out: [b,c,h,w] -- same shape/semantics as the objective the
         Brownian Bridge expects (noise / grad / ysubx, per config).
 
@@ -353,14 +453,20 @@ class MST_Plus_Plus_Diffusion(nn.Module):
         caught here -- wrap your training step in
         `run_train_step_with_cudnn_guard` (defined below) as well.
         """
-        del context, extra
+        del extra
+
+        if self.use_context and context is None:
+            raise ValueError(
+                "Conditioning is enabled, but MST_Plus_Plus_Diffusion received "
+                "context=None. Expected concatenated coarse HSI + RGB context."
+            )
 
         if (self._disable_cudnn_after_engine_error or _CUDNN_ENGINE_ERROR_SEEN) and x.is_cuda:
             with torch.backends.cudnn.flags(enabled=False):
-                return self._forward_impl(x, timesteps)
+                return self._forward_impl(x, timesteps, context)
 
         try:
-            return self._forward_impl(x, timesteps)
+            return self._forward_impl(x, timesteps, context)
         except RuntimeError as error:
             if not x.is_cuda or not self._is_cudnn_engine_error(error):
                 raise
@@ -373,12 +479,13 @@ class MST_Plus_Plus_Diffusion(nn.Module):
             self._disable_cudnn_after_engine_error = True
             disable_cudnn_globally()
             with torch.backends.cudnn.flags(enabled=False):
-                return self._forward_impl(x, timesteps)
+                return self._forward_impl(x, timesteps, context)
 
     def _forward_impl(
         self,
         x: torch.Tensor,
         timesteps: torch.Tensor,
+        context: Optional[torch.Tensor],
     ) -> torch.Tensor:
         b, c, h_inp, w_inp = x.shape
         hb, wb = 8, 8
@@ -386,13 +493,39 @@ class MST_Plus_Plus_Diffusion(nn.Module):
         pad_w = (wb - w_inp % wb) % wb
         x_padded = F.pad(x, [0, pad_w, 0, pad_h], mode='reflect')
 
+        context_padded = context
+        if context_padded is not None:
+            if context_padded.shape[0] != b:
+                raise ValueError(
+                    "Diffusion input and context must have the same batch size, "
+                    f"got x={b} and context={context_padded.shape[0]}."
+                )
+            if context_padded.shape[-2:] != (h_inp, w_inp):
+                context_padded = F.interpolate(
+                    context_padded,
+                    size=(h_inp, w_inp),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            context_padded = F.pad(
+                context_padded,
+                [0, pad_w, 0, pad_h],
+                mode='reflect',
+            )
+
         time_emb = self.time_embedder(timesteps)
 
         h = self.conv_in(x_padded)
-        for mst_block in self.body:
-            h = mst_block(h, time_emb)
+        for stage_index, mst_block in enumerate(self.body):
+            if self.use_context:
+                h = self.context_injections[stage_index](h, context_padded)
+
+            # Feature-space residuals retain the optimization benefit of
+            # stacked MST++ stages without forcing the final Brownian objective
+            # prediction to copy x_t.
+            h = h + mst_block(h, time_emb)
+
         h = self.conv_out(h)
-        h = h + x_padded
 
         return h[:, :, :h_inp, :w_inp]
 
@@ -1262,7 +1395,22 @@ class BrownianBridgeModel(nn.Module):
         model_params = model_config.BB.params
         self.num_timesteps = model_params.num_timesteps
         self.mt_type = model_params.mt_type
-        self.max_var = model_params.max_var if model_params.__contains__("max_var") else 1
+        # This bridge refines an already strong MST++ estimate, so the original
+        # BBDM default max_var=1 can inject noise much larger than the residual
+        # spectral error. Use a refinement-scale variance by default and cap the
+        # legacy max_var unless `refinement_max_var` is explicitly provided.
+        configured_max_var = (
+            float(model_params.max_var)
+            if model_params.__contains__("max_var")
+            else 0.1
+        )
+        self.max_var = (
+            float(model_params.refinement_max_var)
+            if model_params.__contains__("refinement_max_var")
+            else min(configured_max_var, 0.1)
+        )
+        if self.max_var <= 0:
+            raise ValueError(f"max_var must be positive, got {self.max_var}.")
         self.eta = model_params.eta if model_params.__contains__("eta") else 1
         self.skip_sample = model_params.skip_sample
         self.sample_type = model_params.sample_type
