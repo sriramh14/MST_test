@@ -152,7 +152,7 @@ VALIDATION_CROP_SIZE: Optional[int] = TRAIN_CROP_SIZE
 
 # Sinusoidal timestep embedding base width (mirrors the old UNET_MODEL_CHANNELS
 # role: the embedding MLP's hidden/output width is 4x this value).
-MSTPP_DIFFUSION_MODEL_CHANNELS = 16
+MSTPP_DIFFUSION_MODEL_CHANNELS = 32
 
 # Number of stacked MST modules in the MST++ body (same meaning as MST_Plus_Plus's
 # `stage` argument).
@@ -187,7 +187,7 @@ USE_AUGMENTATION = False
 # Training settings.
 BATCH_SIZE = 2
 VALIDATION_BATCH_SIZE = 2
-NUM_EPOCHS = 100
+NUM_EPOCHS = 10
 LEARNING_RATE = 5e-3
 WEIGHT_DECAY = 1e-4
 MIN_LEARNING_RATE = 5e-5
