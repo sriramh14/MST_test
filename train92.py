@@ -199,7 +199,7 @@ SEED = 42
 # AMP settings. Autocast is used only for the training forward pass. Brownian
 # reverse sampling and all validation metrics are deliberately computed in
 # float32 for numerical stability.
-USE_AMP = True
+USE_AMP = False
 PREFER_BFLOAT16 = True
 FP16_INITIAL_SCALE = 1024.0
 FP16_GROWTH_INTERVAL = 2000
