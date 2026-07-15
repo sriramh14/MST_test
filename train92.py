@@ -135,7 +135,7 @@ VALIDATION_PAIR_VALIDATION_CACHE = OUTPUT_DIR / "validation_pair_validation_cach
 # Brownian bridge settings.
 NUM_TIMESTEPS = 100
 MT_TYPE = "linear"
-MAX_VARIANCE = 0.1
+MAX_VARIANCE = 0.05
 SAMPLING_ETA = 0.0
 SKIP_SAMPLE = True
 SAMPLE_TYPE = "linear"
